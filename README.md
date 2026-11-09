@@ -24,6 +24,21 @@ The command that works today, with no models, audio hardware or GPU required:
 cargo test --workspace --no-default-features
 ```
 
+## Frontend development
+
+The web frontend lives at the repository root (Vite + React + TypeScript).
+
+```sh
+npm ci
+npm run dev
+npm test
+```
+
+`npm run dev` serves the frontend at http://localhost:5173 for `npm run tauri dev` and
+browser development; `npm test` runs the Vitest suite. Other scripts: `npm run
+typecheck`, `npm run lint`, `npm run build` (outputs to `dist/`, which the Tauri crate will
+bundle).
+
 ## Models
 
 Regent ships no model weights. Every model has its own licence, and users are responsible
