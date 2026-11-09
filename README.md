@@ -39,6 +39,24 @@ browser development; `npm test` runs the Vitest suite. Other scripts: `npm run
 typecheck`, `npm run lint`, `npm run build` (outputs to `dist/`, which the Tauri crate will
 bundle).
 
+## Tauri app
+
+The desktop app crate is `crates/regent-app` (Tauri v2). From the repository root:
+
+```sh
+npm run tauri dev
+```
+
+starts the Vite dev server on port 5173 and opens the Regent window (380×560, always
+on top) against it.
+
+```sh
+npm run tauri build
+```
+
+builds the release frontend once, then the Rust backend and the installers. Run `npm ci`
+and `npm run build` first so `dist/` exists and dependencies are installed.
+
 ## Models
 
 Regent ships no model weights. Every model has its own licence, and users are responsible
