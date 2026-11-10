@@ -44,6 +44,12 @@ pub fn run() {
             commands::reset_settings,
             commands::pick_model_file,
             commands::request_estimate,
+            commands::start_chat,
+            commands::stop_chat,
+            commands::send_message,
+            commands::cancel_generation,
+            commands::get_chat_state,
+            commands::get_history,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Regent");

@@ -1,11 +1,12 @@
 //! The state every Tauri command shares.
 //!
 //! It is created once in `setup` and handed to commands through Tauri's managed
-//! state. The estimator owns its own worker thread, so computing a forecast
-//! never blocks the UI.
+//! state. The estimator and the chat service each own a worker thread, so the
+//! UI never blocks on a forecast or a reply.
 
 use std::sync::Mutex;
 
+use regent_core::chat::{ChatService, EngineFactory};
 use regent_core::estimate::{Estimate, Estimator, FsInspector};
 use regent_core::hardware::SystemProbe;
 use regent_core::paths::AppPaths;
@@ -15,6 +16,13 @@ use tauri::{AppHandle, Emitter};
 
 /// The event emitted whenever a new memory forecast is ready.
 pub const ESTIMATE_READY: &str = "estimate-ready";
+
+/// The event emitted whenever the chat service changes state.
+pub const CHAT_STATE: &str = "chat-state";
+
+/// The error reported by a build without the llama feature.
+#[cfg(not(feature = "llama"))]
+const NO_ENGINE: &str = "This build of Regent has no text engine.";
 
 /// The payload of [`ESTIMATE_READY`].
 #[derive(Debug, Clone, Serialize)]
@@ -32,6 +40,8 @@ pub struct AppState {
     pub store: Mutex<SettingsStore>,
     /// The worker that computes memory forecasts.
     pub estimator: Estimator,
+    /// The worker that owns the text model and the chat history.
+    pub chat: ChatService,
     /// Every folder and file Regent uses.
     // TODO(settings UI): read by the commands that open folders and models.
     #[allow(dead_code)]
@@ -39,11 +49,13 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Opens the settings and starts the estimator.
+    /// Opens the settings and starts the estimator and chat workers.
     ///
-    /// Every finished forecast is emitted as [`ESTIMATE_READY`] on `app`.
+    /// Every finished forecast is emitted as [`ESTIMATE_READY`] on `app`, and
+    /// every chat state change as [`CHAT_STATE`].
     pub fn new(paths: AppPaths, app: AppHandle) -> Self {
         let store = SettingsStore::open(paths.settings_file.clone());
+        let estimate_app = app.clone();
         let estimator = Estimator::spawn(
             std::sync::Arc::new(SystemProbe::new()),
             std::sync::Arc::new(FsInspector::new()),
@@ -52,13 +64,21 @@ impl AppState {
                     generation,
                     estimate,
                 };
-                let _ = app.emit(ESTIMATE_READY, payload);
+                let _ = estimate_app.emit(ESTIMATE_READY, payload);
+            }),
+        );
+        let chat = ChatService::spawn(
+            paths.database_file.clone(),
+            engine_factory(),
+            Box::new(move |status| {
+                let _ = app.emit(CHAT_STATE, status);
             }),
         );
 
         Self {
             store: Mutex::new(store),
             estimator,
+            chat,
             paths,
         }
     }
@@ -70,5 +90,20 @@ impl AppState {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .settings()
             .clone()
+    }
+}
+
+/// Builds the engine factory for this build.
+fn engine_factory() -> EngineFactory {
+    #[cfg(feature = "llama")]
+    {
+        Box::new(|config| {
+            crate::engine::LlamaChatEngine::load(config)
+                .map(|engine| Box::new(engine) as Box<dyn regent_core::chat::ChatEngine>)
+        })
+    }
+    #[cfg(not(feature = "llama"))]
+    {
+        Box::new(|_config| Err(regent_core::chat::ChatEngineError(NO_ENGINE.to_string())))
     }
 }
