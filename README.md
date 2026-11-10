@@ -24,6 +24,10 @@ The command that works today, with no models, audio hardware or GPU required:
 cargo test --workspace --no-default-features
 ```
 
+The default build also compiles llama.cpp in-process (text engine, behind the default
+`llama` feature of `crates/regent-app`), so it additionally needs CMake and LLVM/libclang.
+`--no-default-features` builds skip llama.cpp entirely.
+
 ## Frontend development
 
 The web frontend lives at the repository root (Vite + React + TypeScript).
