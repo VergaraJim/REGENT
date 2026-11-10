@@ -4,3 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+dirs = "6"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
