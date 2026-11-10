@@ -35,6 +35,10 @@ pub enum EngineError {
     #[error("could not create an inference context: {0}")]
     ContextLoad(#[from] llama_cpp_2::LlamaContextLoadError),
 
+    /// The prompt tokenised to nothing.
+    #[error("the prompt is empty, so there is nothing to generate from")]
+    EmptyPrompt,
+
     /// The prompt could not be tokenised.
     #[error("could not tokenise the prompt: {0}")]
     DecodePrompt(llama_cpp_2::DecodeError),
@@ -55,7 +59,7 @@ pub enum EngineError {
 /// Everything the smoke call reports back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SmokeOutput {
-    /// The generated text (not echoed prompt), decoded lossily-free pieces.
+    /// The generated text (not echoed prompt), decoded from token pieces.
     pub text: String,
     /// Number of tokens the prompt tokenised into.
     pub prompt_tokens: usize,
@@ -82,12 +86,12 @@ fn backend() -> Result<&'static LlamaBackend, EngineError> {
 }
 
 /// Generate text greedily from a GGUF model, on the CPU, to prove the
-/// engineered llama.cpp link works end to end.
+/// llama.cpp link works end to end.
 ///
 /// - loads the model with zero GPU layers and default memory mapping;
 /// - builds a 512-token context;
 /// - threads: `max(1, available_parallelism - 1)`;
-/// - tokens the prompt with the BOS token attached and decodes it;
+/// - tokenises the prompt with the BOS token attached and decodes it;
 /// - greedy-samples up to `max_tokens` tokens, stopping early on
 ///   end-of-generation.
 ///
@@ -127,15 +131,22 @@ pub fn smoke_generate(
     // Tokenise with BOS + parse-special so the model sees a proper opening.
     let tokens = model.vocab().tokenize(prompt.as_bytes(), true, true);
 
-    // Fill the prompt batch; only the final token computes logits.
+    // An empty token list has no last token to sample logits from.
     let prompt_len = tokens.len();
-    let mut batch = LlamaBatch::new(prompt_len, 1);
-    for (i, &token) in tokens.iter().enumerate() {
-        batch
-            .add(token, i as i32, &[0], i == prompt_len - 1)
-            .map_err(EngineError::BatchAdd)?;
+    if prompt_len == 0 {
+        return Err(EngineError::EmptyPrompt);
     }
-    let last_logits_index = (prompt_len - 1) as i32;
+
+    // Fill the prompt batch; only the final token computes logits.
+    let mut batch = LlamaBatch::new(prompt_len, 1);
+    let mut pos = 0i32;
+    for (i, &token) in tokens.iter().enumerate() {
+        let is_last = i + 1 == prompt_len;
+        batch
+            .add(token, pos, &[0], is_last)
+            .map_err(EngineError::BatchAdd)?;
+        pos += 1;
+    }
     ctx.decode(&mut batch).map_err(EngineError::DecodePrompt)?;
 
     // Greedy sampling until end-of-generation or the token budget.
@@ -143,8 +154,10 @@ pub fn smoke_generate(
     let vocab = model.vocab();
     let mut generated: Vec<u8> = Vec::new();
     let mut generated_tokens = 0usize;
-    for pos in (prompt_len as i32..).take(max_tokens as usize) {
-        let token = sampler.sample(&ctx, last_logits_index);
+    for _ in 0..max_tokens {
+        // The batch always ends with the token whose logits we just computed.
+        let last_index = batch.n_tokens() - 1;
+        let token = sampler.sample(&ctx, last_index);
         if vocab.is_eog(token) {
             break;
         }
@@ -156,6 +169,7 @@ pub fn smoke_generate(
         batch.clear();
         batch.add(token, pos, &[0], true)?;
         ctx.decode(&mut batch)?;
+        pos += 1;
     }
 
     Ok(SmokeOutput {
@@ -163,4 +177,17 @@ pub fn smoke_generate(
         prompt_tokens: prompt_len,
         generated_tokens,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EngineError;
+
+    #[test]
+    fn empty_prompt_error_has_plain_language_message() {
+        assert_eq!(
+            EngineError::EmptyPrompt.to_string(),
+            "the prompt is empty, so there is nothing to generate from"
+        );
+    }
 }

@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted, 2026-11-14
+Accepted, 2026-11-10
 
 ## Context
 
@@ -56,7 +56,7 @@ opt-in test.
 
 The spec (§2.6) plans to load ggml GPU backends **dynamically at runtime**, so a machine
 without a GPU or with a broken driver never blocks launch. When we take that step, we
-enable ` llama-cpp-2`'s `dynamic-backends` feature (which builds the GPU backend DLLs out
+enable `llama-cpp-2`'s `dynamic-backends` feature (which builds the GPU backend DLLs out
 of the main link and loads them with `load_backends_from_path`): missing files then just
 mean CPU inference. Until then, CPU is the only path and no GPU DLL ships in the bundle.
 
