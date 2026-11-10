@@ -54,6 +54,159 @@ function sha256File(path) {
   return createHash('sha256').update(readFileSync(path)).digest('hex');
 }
 
+// The dynamic Visual C++ runtime that piper.exe and its DLLs import. Microsoft allows
+// these to be copied next to the executable that uses them (app-local deployment) from
+// the Visual Studio `VC\Redist\MSVC` folder, so a clean Windows machine without the
+// VC++ redistributable can still speak.
+const vcRuntimeNames = ['msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll'];
+
+// Maps lower-case name -> actual entry name in `dir`, or null when `dir` is unreadable.
+function filesByName(dir) {
+  try {
+    const map = new Map();
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.isFile()) map.set(entry.name.toLowerCase(), entry.name);
+    }
+    return map;
+  } catch {
+    return null;
+  }
+}
+
+function vcRuntimeSource(dir) {
+  const files = filesByName(dir);
+  if (!files || !vcRuntimeNames.every((name) => files.has(name))) return null;
+  return files;
+}
+
+// Folder names that are dotted integers (`14.44.35207`), as numbers, or null.
+function versionSegments(name) {
+  const segments = name.split('.');
+  if (!segments.every((segment) => /^\d+$/.test(segment))) return null;
+  return segments.map(Number);
+}
+
+function compareSegments(a, b) {
+  for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
+    const diff = (a[i] ?? 0) - (b[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
+// Every integer group in a name, so `Microsoft.VC143.CRT` sorts by its 143.
+function numericKey(name) {
+  return (name.match(/\d+/g) ?? []).map(Number);
+}
+
+// The `x64\Microsoft.VC14*.CRT` folders of a `VC\Redist\MSVC` (or `VCToolsRedistDir`)
+// root, highest version first.
+function crtFolders(redistDir) {
+  const x64 = join(redistDir, 'x64');
+  let entries;
+  try {
+    entries = readdirSync(x64, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((entry) => entry.isDirectory() && /^Microsoft\.VC14.*\.CRT$/i.test(entry.name))
+    .map((entry) => join(x64, entry.name))
+    .sort((a, b) => compareSegments(numericKey(b), numericKey(a)));
+}
+
+function findVcRuntimeDir() {
+  const override = process.env.REGENT_VC_REDIST_DIR;
+  if (override) {
+    // An explicit override is authoritative: a wrong path is a mistake worth reporting,
+    // not something to paper over with a different source.
+    const files = vcRuntimeSource(override);
+    if (!files) failVcRuntime();
+    return { dir: override, files };
+  }
+
+  const toolsRedist = process.env.VCToolsRedistDir;
+  if (toolsRedist) {
+    for (const dir of crtFolders(toolsRedist)) {
+      const files = vcRuntimeSource(dir);
+      if (files) return { dir, files };
+    }
+  }
+
+  const programFilesX86 = process.env['ProgramFiles(x86)'] || process.env.ProgramFiles;
+  if (programFilesX86) {
+    const vswhere = join(programFilesX86, 'Microsoft Visual Studio', 'Installer', 'vswhere.exe');
+    if (existsSync(vswhere)) {
+      const result = spawnSync(
+        vswhere,
+        [
+          '-latest',
+          '-products',
+          '*',
+          '-requires',
+          'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+          '-property',
+          'installationPath',
+        ],
+        { encoding: 'utf8' },
+      );
+      const installationPath = result.status === 0 ? result.stdout.trim() : '';
+      if (installationPath) {
+        const redistRoot = join(installationPath, 'VC', 'Redist', 'MSVC');
+        let versions;
+        try {
+          versions = readdirSync(redistRoot, { withFileTypes: true });
+        } catch {
+          versions = [];
+        }
+        const ordered = versions
+          .filter((entry) => entry.isDirectory() && versionSegments(entry.name) !== null)
+          .map((entry) => entry.name)
+          .sort((a, b) => compareSegments(versionSegments(b), versionSegments(a)));
+        for (const version of ordered) {
+          for (const dir of crtFolders(join(redistRoot, version))) {
+            const files = vcRuntimeSource(dir);
+            if (files) return { dir, files };
+          }
+        }
+      }
+    }
+  }
+
+  failVcRuntime();
+}
+
+function failVcRuntime() {
+  fail(
+    `could not find ${vcRuntimeNames.join(', ')} in a Visual Studio redistributable folder; ` +
+      'set REGENT_VC_REDIST_DIR to a folder holding those DLLs, or install the ' +
+      'Visual Studio C++ build tools',
+  );
+}
+
+function ensureVcRuntime(triple) {
+  if (!triple.includes('windows')) return;
+
+  const { dir, files } = findVcRuntimeDir();
+  let copied = false;
+  for (const name of vcRuntimeNames) {
+    const source = join(dir, files.get(name));
+    const target = join(resourceDir, name);
+    if (existsSync(target)) {
+      const existing = statSync(target);
+      const incoming = statSync(source);
+      if (existing.size === incoming.size && sha256File(target) === sha256File(source)) continue;
+    }
+    copyFileSync(source, target);
+    copied = true;
+  }
+  console.log(
+    copied
+      ? `fetch-piper: VC++ runtime copied from ${dir}`
+      : 'fetch-piper: VC++ runtime already present',
+  );
+}
+
 function copyDir(from, to) {
   mkdirSync(to, { recursive: true });
   for (const entry of readdirSync(from, { withFileTypes: true })) {
@@ -100,6 +253,7 @@ async function main() {
     readFileSync(stampPath, 'utf8').trim() === sha256
   ) {
     console.log(`Piper already present (${triple})`);
+    ensureVcRuntime(triple);
     return;
   }
 
@@ -147,6 +301,7 @@ async function main() {
     console.log(
       `fetch-piper: installed Piper ${manifest.version} into ${relative(repoRoot, resourceDir)}`,
     );
+    ensureVcRuntime(triple);
   } finally {
     rmSync(partPath, { force: true });
     rmSync(workDir, { recursive: true, force: true });

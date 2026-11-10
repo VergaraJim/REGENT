@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted, 2026-11-17
+Accepted, 2026-11-10
 
 ## Context
 
@@ -66,7 +66,9 @@ espeak-ng ships as a separate shared library and data folder that the Piper exec
 loads; it is not linked into `regent-app`, which is what keeps the app's own licence
 position unchanged (decision 0001). Our notices (`THIRD_PARTY_NOTICES` and the
 `licenses/` folder) must carry the licence texts for all four and a written offer for
-the espeak-ng sources, pointing at the exact release tag.
+the espeak-ng sources, pointing at the exact release tag. The VC++ runtime DLLs shipped
+on Windows are covered by the Visual Studio redistribution terms and need their own
+entry in the notices.
 
 ## Voices
 
@@ -83,11 +85,20 @@ Regent refuses a voice whose config file is missing with "This voice needs its
   Windows installer want every nested executable signed. An unsigned `piper` binary
   inside `Resources/` can fail Gatekeeper or break the bundle's signature. The fallback
   is the same: build Piper from source in CI and sign it as part of the build.
-- **Windows VC runtime imports.** `piper.exe` and its DLLs import `VCRUNTIME140.dll`,
-  `VCRUNTIME140_1.dll` and `MSVCP140.dll` (checked with `dumpbin /dependents`), so they
-  need the Visual C++ redistributable on the machine. Shipping those DLLs next to
-  `piper.exe` (legacy app-local deployment) is a follow-up task; until then this is a
-  gap in the "install nothing" promise for TTS on a clean Windows machine.
+## Windows runtime
+
+`piper.exe` and its DLLs import the dynamic Visual C++ runtime: `MSVCP140.dll`,
+`VCRUNTIME140.dll` and `VCRUNTIME140_1.dll` (checked with `dumpbin /dependents`). On
+Windows targets `scripts/fetch-piper.mjs` therefore copies `msvcp140.dll`,
+`vcruntime140.dll` and `vcruntime140_1.dll` into `resources/piper/`, so they ship next
+to `piper.exe` in dev and in the installers. These are Microsoft redistributable files
+deployed app-local, which the Visual Studio redistribution terms allow. The source
+folder is looked up in this order: `REGENT_VC_REDIST_DIR` (a folder holding the three
+DLLs), then `VCToolsRedistDir` (set in a VS developer prompt) via its
+`x64/Microsoft.VC14*.CRT` folder, then `vswhere.exe` to find the newest Visual Studio
+install and its highest `VC\Redist\MSVC\<version>\x64\Microsoft.VC14*.CRT`. Only
+Windows x64 is supported. `regent-app.exe` itself still uses the static C runtime and
+never loads these DLLs.
 
 ## Consequences
 

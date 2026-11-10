@@ -21,4 +21,10 @@ and touches no network.
 `beforeDevCommand` / `beforeBuildCommand`, and the whole folder ships as a Tauri
 resource at `piper/` next to the app.
 
+On Windows, the fetch step also copies `msvcp140.dll`, `vcruntime140.dll` and
+`vcruntime140_1.dll` here from the local Visual Studio install (the `VC\Redist\MSVC`
+folder), so Piper runs on a machine without the Visual C++ redistributable. Set
+`REGENT_VC_REDIST_DIR` to a folder that holds those three DLLs to use a different
+source.
+
 Voices (`.onnx` plus `.onnx.json`) are not part of this folder: the user picks them.
