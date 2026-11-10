@@ -25,8 +25,29 @@ cargo test --workspace --no-default-features
 ```
 
 The default build also compiles llama.cpp in-process (text engine, behind the default
-`llama` feature of `crates/regent-app`), so it additionally needs CMake and LLVM/libclang.
-`--no-default-features` builds skip llama.cpp entirely.
+`llama` feature of `crates/regent-app`) and whisper.cpp for the `regent-stt` helper
+(behind its default `whisper` feature), so it additionally needs CMake and LLVM/libclang.
+`--no-default-features` builds skip both native engines entirely.
+
+## Speech-to-text helper
+
+`crates/regent-stt` is a separate executable so whisper.cpp's vendored ggml never has to
+link into the same binary as llama.cpp. It speaks binary frames in, JSON lines out, over
+stdin/stdout only; see `docs/decisions/0005-stt-helper.md` for the protocol and lifetime
+rules.
+
+```sh
+cargo test -p regent-stt --no-default-features   # protocol tests, no model needed
+cargo build -p regent-stt                        # compiles whisper.cpp
+```
+
+To exercise the real model once you have a GGML whisper model on disk:
+
+```powershell
+$env:REGENT_TEST_STT_MODEL="C:\path\to\ggml-base.en.bin"
+cargo test -p regent-stt --test whisper_smoke -- --nocapture
+```
+
 
 ## Frontend development
 
