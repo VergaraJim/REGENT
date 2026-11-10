@@ -13,6 +13,7 @@ import { ChevronLeft } from "lucide-react";
 import { Section } from "../components/settings/Section.tsx";
 import { StatusBanner } from "../components/settings/StatusBanner.tsx";
 import { ModelSlotRow } from "../components/settings/ModelSlotRow.tsx";
+import { MemoryContextCard } from "../components/settings/MemoryContextCard.tsx";
 import { SlotOptions, optionSlotId } from "../components/settings/SlotOptions.tsx";
 import { useEstimate } from "../hooks/useEstimate.ts";
 import type { SettingsController } from "../hooks/useSettings.ts";
@@ -31,7 +32,7 @@ export function SettingsView({
 }) {
   const { view, saveError, update, reset } = controller;
   const settings = view?.settings ?? null;
-  const estimate = useEstimate(settings).estimate;
+  const { estimate, pending } = useEstimate(settings);
   const [spinnerVisible, setSpinnerVisible] = useState(false);
 
   useEffect(() => {
@@ -182,6 +183,15 @@ export function SettingsView({
                 ]}
                 onPick={setPath}
                 onRemove={removePath}
+              />
+            </Section>
+
+            <Section title="Memory & context">
+              <MemoryContextCard
+                settings={settings}
+                estimate={estimate}
+                pending={pending}
+                onChange={update}
               />
             </Section>
 

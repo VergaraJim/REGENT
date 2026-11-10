@@ -14,6 +14,16 @@ export function clamp(n: number, min: number, max: number): number {
   return Math.min(Math.max(n, min), max);
 }
 
+/** Bytes as gigabytes with one decimal, e.g. `"6.2"`. */
+export function formatGb(bytes: number): string {
+  return (bytes / 1024 ** 3).toFixed(1);
+}
+
+/** A token count with grouped thousands, e.g. `"32,768"`. */
+export function formatTokens(n: number): string {
+  return n.toLocaleString("en-US");
+}
+
 /** A plain-language message for anything thrown by an IPC call. */
 export function errorMessage(error: unknown): string {
   if (typeof error === "string" && error.trim()) return error;
