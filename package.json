@@ -9,6 +9,7 @@
     "typecheck": "tsc -b",
     "lint": "eslint .",
     "test": "vitest run",
+    "fetch:piper": "node scripts/fetch-piper.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

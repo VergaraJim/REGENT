@@ -1,6 +1,7 @@
 mod commands;
 
 pub mod engine;
+pub mod tts;
 
 pub fn run() {
     tauri::Builder::default()

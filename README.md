@@ -49,6 +49,29 @@ cargo test -p regent-stt --test whisper_smoke -- --nocapture
 ```
 
 
+## Text-to-speech
+
+Replies are spoken by Piper, which ships inside the app: the pinned release is fetched
+at build time into `crates/regent-app/resources/piper/` and bundled as a resource, so it
+is never taken from `PATH` and nothing is installed separately. The URL, size and
+SHA-256 per target triple live in `third_party/piper/manifest.json`.
+
+```sh
+npm run fetch:piper
+```
+
+`npm run tauri dev` and `npm run tauri build` run it automatically and skip the network
+when the engine is already there. Fetched binaries are not committed. Voices are model
+files the user picks (`.onnx` plus its `.onnx.json`); see
+`docs/decisions/0006-tts-piper.md`.
+
+To exercise the real engine, point it at a Piper voice:
+
+```powershell
+$env:REGENT_TEST_PIPER_VOICE="C:\path\to\en_US-lessac-low.onnx"
+cargo test -p regent-app --no-default-features --test piper_smoke -- --nocapture
+```
+
 ## Frontend development
 
 The web frontend lives at the repository root (Vite + React + TypeScript).
