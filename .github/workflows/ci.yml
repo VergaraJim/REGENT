@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# One run per ref: a new push cancels the previous, still-running build.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One failing OS must not hide the result on the others.
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - ubuntu-24.04
+          - macos-latest
+          # macos-15-intel is GitHub's x64 macOS runner; macos-latest is arm64.
+          - macos-15-intel
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Update Linux package lists
+        if: runner.os == 'Linux'
+        run: sudo apt-get update
+
+      # Tauri's Linux dependencies, plus what llama.cpp, whisper.cpp and bindgen need.
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: >
+          sudo apt-get install -y --no-install-recommends
+          libwebkit2gtk-4.1-dev
+          libxdo-dev
+          libssl-dev
+          libayatana-appindicator3-dev
+          librsvg2-dev
+          libasound2-dev
+          cmake
+          clang
+          libclang-dev
+          pkg-config
+
+      # Checks that need no native engines: fast failure before the long builds.
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Typecheck frontend
+        run: npm run typecheck
+
+      - name: Lint frontend
+        run: npm run lint
+
+      - name: Test frontend
+        run: npm test
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy (no default features)
+        run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+
+      - name: Test Rust (no default features)
+        run: cargo test --workspace --no-default-features
+
+      # From here on the native engines are involved: this builds llama.cpp
+      # (regent-app's default `llama` feature) and whisper.cpp (regent-stt's
+      # default `whisper` feature), which is the point of the matrix.
+      - name: Fetch Piper
+        run: npm run fetch:piper
+
+      - name: Build workspace with default features
+        run: cargo build --workspace
+
+      - name: Clippy (default features)
+        run: cargo clippy --workspace --all-targets -- -D warnings

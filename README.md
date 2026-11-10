@@ -105,6 +105,16 @@ npm run tauri build
 builds the release frontend once, then the Rust backend and the installers. Run `npm ci`
 and `npm run build` first so `dist/` exists and dependencies are installed.
 
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push to `main` and on every pull request, on
+Windows, Ubuntu 24.04 and macOS (arm64 and x64). Each matrix job installs Node 22 and
+stable Rust, then runs the frontend checks (`npm run typecheck`, `npm run lint`,
+`npm test`, `npm run build`), the Rust fmt/clippy/test checks without default features,
+and finally fetches Piper and runs a full default-feature `cargo build --workspace` plus
+clippy. That last part is the point: it proves llama.cpp and whisper.cpp compile and link
+on all four runners, with no models, audio hardware or GPU needed.
+
 ## Models
 
 Regent ships no model weights. Every model has its own licence, and users are responsible
