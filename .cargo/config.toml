@@ -1,0 +1,15 @@
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[env]
+# llama-cpp-sys-2 reads LLAMA_STATIC_CRT=1 and then sets `/MT`-style flags on
+# its CMake invocation, and it forwards every `CMAKE_*` env var as a CMake
+# cache entry. The MSVC flags alone are not enough under the msbuild generator
+# (CMake keeps the default MD runtime in the generated .vcxproj), so we also
+# force the CMake runtime selection explicitly. See decision 0004.
+LLAMA_STATIC_CRT = "1"
+CMAKE_MSVC_RUNTIME_LIBRARY = "MultiThreaded"
+CMAKE_POLICY_DEFAULT_CMP0091 = "NEW"

@@ -1,0 +1,12 @@
+/target/
+node_modules/
+/dist/
+.soma/
+*.part
+*.gguf
+*.onnx
+*.onnx.json
+/models/
+.env
+/crates/regent-app/resources/piper/*
+!/crates/regent-app/resources/piper/README.md
