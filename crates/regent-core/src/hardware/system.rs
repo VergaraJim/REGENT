@@ -129,8 +129,10 @@ mod tests {
     }
 
     #[test]
-    fn stub_gpu_detection_finds_nothing() {
+    fn gpu_detection_is_cached() {
         let probe = SystemProbe::new();
-        assert_eq!(probe.gpus(), GpuReport::default());
+        let first = probe.gpus();
+        let second = probe.gpus();
+        assert_eq!(first, second);
     }
 }

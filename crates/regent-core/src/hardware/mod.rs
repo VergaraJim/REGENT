@@ -1,8 +1,8 @@
 //! What the machine can do, and how much of it Regent may use.
 //!
 //! Detection is behind the [`HardwareProbe`] trait so the budget rules can be
-//! tested with [`testing::FakeProbe`] on any machine. GPU detection is a stub
-//! for now: [`GpuReport::default`] (no GPUs, no unified memory).
+//! tested with [`testing::FakeProbe`] on any machine. GPU detection lives in the
+//! `gpu` module, one implementation per operating system, and never panics.
 
 mod budget;
 mod gpu;

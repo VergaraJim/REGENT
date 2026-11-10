@@ -12,5 +12,22 @@ dirs = "6"
 thiserror = "2"
 sysinfo = "0.40"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+# DXCore is looked up at runtime through `libloading`, never linked statically:
+# a machine without `dxcore.dll` must still launch Regent.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_DXCore",
+] }
+libloading = "0.9"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# `nvml-wrapper` dlopens `libnvidia-ml.so.1`; no driver means no NVIDIA entries.
+nvml-wrapper = "0.13"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-metal = "0.3"
+
 [dev-dependencies]
 tempfile = "3"
