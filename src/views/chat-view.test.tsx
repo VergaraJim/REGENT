@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import { ChatView } from "./ChatView.tsx";
 import type { ChatController } from "../hooks/useChat.ts";
-import type { ChatMessage, ChatState } from "../lib/api.ts";
+import type { ChatMessage, ChatState, MemoryStatus } from "../lib/api.ts";
 
 function controller(
   chatState: ChatState,
@@ -14,6 +14,7 @@ function controller(
     error: null,
     turnError: null,
     streamingText: null,
+    streamingTools: [],
     compactingReply: false,
     start: () => {},
     stop: () => {},
@@ -23,12 +24,17 @@ function controller(
   };
 }
 
-function render(chat: ChatController, textModelSet = true): string {
+function render(
+  chat: ChatController,
+  textModelSet = true,
+  memory: MemoryStatus | null = null,
+): string {
   return renderToStaticMarkup(
     <ChatView
       controller={chat}
       textModelSet={textModelSet}
       onOpenSettings={() => {}}
+      memory={memory}
     />,
   );
 }
@@ -134,5 +140,93 @@ describe("ChatView markup", () => {
     expect(log).toBeGreaterThanOrEqual(0);
     expect(hint).toBeGreaterThan(log);
     expect(hint).toBeLessThan(composer);
+  });
+
+  it("shows a reply that used a tool as one bubble with a chip", () => {
+    const html = render(
+      controller("ready", {
+        messages: [
+          ...messages,
+          {
+            id: 3,
+            role: "tool",
+            text: "recalled text",
+            from_voice: false,
+            created_at: 3,
+            tool_name: "search_memory",
+            tool_call: "{}",
+          },
+          {
+            id: 4,
+            role: "assistant",
+            text: "It was option B.",
+            from_voice: false,
+            created_at: 4,
+          },
+        ],
+      }),
+    );
+
+    expect(html.match(/Searched memory/g)).toHaveLength(1);
+    expect(html.match(/Hi! How can I help\?/g)).toHaveLength(1);
+    expect(html).toContain("It was option B.");
+    expect(html).not.toContain("recalled text");
+  });
+
+  it("shows the memory count while ready", () => {
+    const html = render(controller("ready", { messages }), true, {
+      state: "ready",
+      indexed: 3,
+      total: 5,
+      error: null,
+    });
+    expect(html).toContain("Memory: 3 of 5 messages saved");
+    expect(html).toContain('aria-live="polite"');
+    expect(html).not.toContain("indexing…");
+  });
+
+  it("shows indexing after the count", () => {
+    const html = render(controller("ready", { messages }), true, {
+      state: "indexing",
+      indexed: 1,
+      total: 5,
+      error: null,
+    });
+    expect(html).toContain("Memory: 1 of 5 messages saved · indexing…");
+  });
+
+  it("shows the paused hint", () => {
+    const html = render(controller("ready", { messages }), true, {
+      state: "paused",
+      indexed: 0,
+      total: 0,
+      error: null,
+    });
+    expect(html).toContain("Memory paused. Restart Regent to try again.");
+  });
+
+  it("renders no memory line without a memory model", () => {
+    const html = render(controller("ready", { messages }), true, null);
+    expect(html).not.toContain("Memory");
+    expect(html).not.toContain("indexing…");
+
+    const off = render(controller("ready", { messages }), true, {
+      state: "off",
+      indexed: 0,
+      total: 0,
+      error: null,
+    });
+    expect(off).not.toContain("Memory");
+  });
+
+  it("shows a memory error while off", () => {
+    const html = render(controller("ready", { messages }), true, {
+      state: "off",
+      indexed: 0,
+      total: 0,
+      error: "The embedding model could not load.",
+    });
+    expect(html).toContain("The embedding model could not load.");
+    expect(html).toContain("truncate");
   });
 });

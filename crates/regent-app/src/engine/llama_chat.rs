@@ -478,7 +478,7 @@ fn summarizer_context_size(prompt_len: usize, max_tokens: usize, main_ctx: usize
 }
 
 /// The threads every context uses.
-fn thread_count() -> i32 {
+pub(crate) fn thread_count() -> i32 {
     i32::try_from(
         std::thread::available_parallelism()
             .map_or(1, |count| count.get())
@@ -543,6 +543,9 @@ fn role_name(role: PromptRole) -> &'static str {
         PromptRole::System => "system",
         PromptRole::User => "user",
         PromptRole::Assistant => "assistant",
+        // Most chat templates only accept user and assistant turns, so a tool
+        // result is replayed as a user message.
+        PromptRole::Tool => "user",
     }
 }
 

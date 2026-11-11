@@ -228,7 +228,7 @@ export const ESTIMATE_READY_EVENT = "estimate-ready";
 /* Chat                                                                */
 /* ------------------------------------------------------------------ */
 
-export type ChatRole = "user" | "assistant";
+export type ChatRole = "user" | "assistant" | "tool";
 
 /** Where the chat engine is in its lifecycle. */
 export type ChatState =
@@ -246,6 +246,10 @@ export interface ChatMessage {
   text: string;
   from_voice: boolean;
   created_at: number;
+  /** The tool that produced a `tool` row, e.g. `search_memory`; null elsewhere. */
+  tool_name?: string | null;
+  /** The raw call that produced a `tool` row; null elsewhere. */
+  tool_call?: string | null;
 }
 
 /** The payload of the `chat-state` event and of `get_chat_state`. */
@@ -268,12 +272,29 @@ export interface GenerationStats {
 export type ChatEvent =
   | { type: "compacting" }
   | { type: "token"; text: string }
+  | { type: "tool"; name: string }
   | { type: "done"; message_id: number; stats: GenerationStats }
   | { type: "cancelled"; message_id: number | null }
   | { type: "error"; message: string };
 
 /** The event the backend emits whenever the chat engine changes state. */
 export const CHAT_STATE_EVENT = "chat-state";
+
+/** Where the memory index is in its lifecycle. */
+export type MemoryState = "off" | "ready" | "indexing" | "paused";
+
+/** The payload of the `memory-status` event and of `get_memory_status`. */
+export interface MemoryStatus {
+  state: MemoryState;
+  /** Messages already embedded into the index. */
+  indexed: number;
+  /** Messages the index should hold. */
+  total: number;
+  error: string | null;
+}
+
+/** The event the backend emits whenever the memory index changes state. */
+export const MEMORY_STATUS_EVENT = "memory-status";
 
 /* ------------------------------------------------------------------ */
 /* Commands                                                            */
@@ -369,6 +390,20 @@ export function onChatState(
   cb: (event: ChatStateEvent) => void,
 ): Promise<UnlistenFn> {
   return listen<ChatStateEvent>(CHAT_STATE_EVENT, (event) => {
+    cb(event.payload);
+  });
+}
+
+/** Reads the memory index's current state. */
+export function getMemoryStatus(): Promise<MemoryStatus> {
+  return invoke<MemoryStatus>("get_memory_status");
+}
+
+/** Calls `cb` for every memory state change. Remember to call the unlistener. */
+export function onMemoryStatus(
+  cb: (event: MemoryStatus) => void,
+): Promise<UnlistenFn> {
+  return listen<MemoryStatus>(MEMORY_STATUS_EVENT, (event) => {
     cb(event.payload);
   });
 }

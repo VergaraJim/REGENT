@@ -7,5 +7,7 @@ pub mod estimate;
 pub mod footprint;
 pub mod gguf;
 pub mod hardware;
+mod hash;
+pub mod memory;
 pub mod paths;
 pub mod settings;

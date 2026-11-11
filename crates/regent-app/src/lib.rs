@@ -49,6 +49,7 @@ pub fn run() {
             commands::send_message,
             commands::cancel_generation,
             commands::get_chat_state,
+            commands::get_memory_status,
             commands::get_history,
         ])
         .run(tauri::generate_context!())

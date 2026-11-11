@@ -10,6 +10,7 @@ use regent_core::chat::{
     ChatEvent, ChatMessage, ChatStatus, EngineConfig, TurnSettings, HISTORY_READ_CAP,
 };
 use regent_core::estimate::SlotId;
+use regent_core::memory::{EmbeddingConfig, MemoryStatus};
 use regent_core::settings::{SaveError, Settings, SettingsStore};
 use serde::Serialize;
 use tauri::ipc::Channel;
@@ -181,15 +182,18 @@ pub async fn request_estimate(app: AppHandle, settings: Option<Settings>) -> u64
 /// has to show them.
 #[tauri::command]
 pub async fn start_chat(app: AppHandle) -> Result<(), CommandError> {
-    let config = {
+    let (config, embedding) = {
         let state = app.state::<AppState>();
-        engine_config(&state.settings())
+        let settings = state.settings();
+        (engine_config(&settings), embedding_config(&settings))
     };
     let handle = app.clone();
-    tauri::async_runtime::spawn_blocking(move || handle.state::<AppState>().chat.start(config))
-        .await
-        .map_err(|_| CommandError::new(CHAT_TASK_FAILED))?
-        .map_err(CommandError::new)
+    tauri::async_runtime::spawn_blocking(move || {
+        handle.state::<AppState>().chat.start(config, embedding)
+    })
+    .await
+    .map_err(|_| CommandError::new(CHAT_TASK_FAILED))?
+    .map_err(CommandError::new)
 }
 
 /// Drops the text model and stops any reply that is streaming.
@@ -211,6 +215,12 @@ pub async fn cancel_generation(app: AppHandle) {
 #[tauri::command]
 pub async fn get_chat_state(app: AppHandle) -> ChatStatus {
     app.state::<AppState>().chat.status()
+}
+
+/// The memory indexer's current state.
+#[tauri::command]
+pub async fn get_memory_status(app: AppHandle) -> MemoryStatus {
+    app.state::<AppState>().chat.memory_status()
 }
 
 /// The newest stored chat messages, oldest first.
@@ -263,6 +273,19 @@ fn engine_config(settings: &Settings) -> Option<EngineConfig> {
         model_path: path.clone(),
         gpu_layers: slot.gpu_layers,
         context_size: slot.context_size,
+    })
+}
+
+/// The memory model configuration from the settings, or `None` when no memory
+/// model is chosen.
+fn embedding_config(settings: &Settings) -> Option<EmbeddingConfig> {
+    let slot = &settings.models.embedding;
+    slot.path.as_ref().map(|path| EmbeddingConfig {
+        model_path: path.clone(),
+        gpu_layers: slot.gpu_layers,
+        context_size: slot.context_size,
+        document_prefix: slot.document_prefix.clone(),
+        query_prefix: slot.query_prefix.clone(),
     })
 }
 

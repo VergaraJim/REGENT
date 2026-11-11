@@ -116,6 +116,8 @@ fn llama_chat_engine_reuses_its_cache_and_summarizes() {
             text: "What is the capital of France?".to_string(),
             from_voice: false,
             created_at: 0,
+            tool_name: None,
+            tool_call: None,
         },
         ChatMessage {
             id: 2,
@@ -123,6 +125,8 @@ fn llama_chat_engine_reuses_its_cache_and_summarizes() {
             text: reply,
             from_voice: false,
             created_at: 0,
+            tool_name: None,
+            tool_call: None,
         },
     ];
     let summary_prompt = build_summary_prompt(None, &fold);
