@@ -7,6 +7,7 @@
 pub mod compaction;
 pub mod engine;
 pub mod message;
+pub mod prefix_cache;
 pub mod prompt;
 pub mod service;
 pub mod store;
@@ -19,6 +20,7 @@ pub use compaction::{
 };
 pub use engine::{ChatEngine, ChatEngineError, EngineConfig, FakeEngine, GenerationStats, Outcome};
 pub use message::{ChatMessage, Role};
+pub use prefix_cache::{CacheIdentity, PrefixCache, PrefixKey};
 pub use prompt::{
     build_prompt, system_text, PromptMessage, PromptRole, REPLY_RESERVE_TOKENS, SYSTEM_PROMPT,
 };

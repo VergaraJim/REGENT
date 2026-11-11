@@ -238,6 +238,7 @@ pub async fn send_message(
         TurnSettings {
             system_addition: settings.system_prompt_addition.clone(),
             compaction: settings.compaction.clone(),
+            persist_prefix_cache: settings.persist_prefix_cache,
         }
     };
     let handle = app.clone();

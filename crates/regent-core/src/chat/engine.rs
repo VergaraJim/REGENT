@@ -5,12 +5,13 @@
 //! [`ChatEngine`] in a later stage; everything above the trait is tested with
 //! the fake.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
+use super::prefix_cache::CacheIdentity;
 use super::prompt::PromptMessage;
 
 /// How to load the text model.
@@ -93,6 +94,37 @@ pub trait ChatEngine: Send {
             "This engine can't write summaries.".to_string(),
         ))
     }
+
+    /// What the persisted prefix cache must match for this engine, or `None`
+    /// when the engine cannot persist one.
+    fn cache_identity(&self) -> Option<CacheIdentity> {
+        None
+    }
+
+    /// Writes the KV state for `prefix` to `path` so a later session can load
+    /// it instead of decoding the prefix again.
+    fn save_prefix(
+        &mut self,
+        prefix: &[PromptMessage],
+        path: &Path,
+    ) -> Result<(), ChatEngineError> {
+        let _ = (prefix, path);
+        Err(ChatEngineError(
+            "This engine can't save its prompt cache.".to_string(),
+        ))
+    }
+
+    /// Loads the KV state for `prefix` from `path`.
+    ///
+    /// Returns whether the state was loaded and is now in use.
+    fn load_prefix(
+        &mut self,
+        prefix: &[PromptMessage],
+        path: &Path,
+    ) -> Result<bool, ChatEngineError> {
+        let _ = (prefix, path);
+        Ok(false)
+    }
 }
 
 /// A deterministic engine that emits fixed pieces.
@@ -105,6 +137,7 @@ pub struct FakeEngine {
     fail: Option<String>,
     summaries: Vec<String>,
     prompts: Option<Arc<Mutex<Vec<Vec<PromptMessage>>>>>,
+    prefix_cache: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 impl FakeEngine {
@@ -117,6 +150,7 @@ impl FakeEngine {
             fail: None,
             summaries: Vec::new(),
             prompts: None,
+            prefix_cache: None,
         }
     }
 
@@ -128,6 +162,7 @@ impl FakeEngine {
             fail: Some(message.into()),
             summaries: Vec::new(),
             prompts: None,
+            prefix_cache: None,
         }
     }
 
@@ -143,6 +178,23 @@ impl FakeEngine {
     pub fn with_prompt_log(mut self, log: Arc<Mutex<Vec<Vec<PromptMessage>>>>) -> Self {
         self.prompts = Some(log);
         self
+    }
+
+    /// Backs [`ChatEngine::save_prefix`] and [`ChatEngine::load_prefix`] with a
+    /// file, recording `"save"`, `"load:true"` or `"load:false"` in `log` so a
+    /// test can see what the service did.
+    pub fn with_prefix_cache(mut self, log: Arc<Mutex<Vec<String>>>) -> Self {
+        self.prefix_cache = Some(log);
+        self
+    }
+
+    /// Appends `entry` to the prefix cache log, when one is attached.
+    fn log_prefix(&self, entry: &str) {
+        if let Some(log) = &self.prefix_cache {
+            log.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(entry.to_string());
+        }
     }
 
     /// Records `prompt` when a prompt log is attached.
@@ -203,6 +255,40 @@ impl ChatEngine for FakeEngine {
             ));
         }
         Ok(Some(self.summaries.remove(0)))
+    }
+
+    fn cache_identity(&self) -> Option<CacheIdentity> {
+        self.prefix_cache.as_ref().map(|_| CacheIdentity {
+            kv_type: "f16".to_string(),
+            chat_template: "fake-template".to_string(),
+            engine_version: "fake-1".to_string(),
+            context_size: self.context_tokens,
+        })
+    }
+
+    fn save_prefix(
+        &mut self,
+        prefix: &[PromptMessage],
+        path: &Path,
+    ) -> Result<(), ChatEngineError> {
+        let Some(message) = prefix.first() else {
+            return Err(ChatEngineError("There is no prefix to save.".to_string()));
+        };
+        std::fs::write(path, &message.text)
+            .map_err(|error| ChatEngineError(format!("Couldn't save the prompt cache: {error}")))?;
+        self.log_prefix("save");
+        Ok(())
+    }
+
+    fn load_prefix(
+        &mut self,
+        prefix: &[PromptMessage],
+        path: &Path,
+    ) -> Result<bool, ChatEngineError> {
+        let saved = std::fs::read_to_string(path).unwrap_or_default();
+        let loaded = prefix.first().is_some_and(|message| message.text == saved);
+        self.log_prefix(if loaded { "load:true" } else { "load:false" });
+        Ok(loaded)
     }
 }
 

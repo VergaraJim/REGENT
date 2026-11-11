@@ -20,7 +20,8 @@ use super::compaction::{
 };
 use super::engine::{ChatEngine, ChatEngineError, EngineConfig, GenerationStats, Outcome};
 use super::message::{ChatMessage, Role};
-use super::prompt::{build_prompt, system_text};
+use super::prefix_cache::{PrefixCache, PrefixKey};
+use super::prompt::{build_prompt, system_text, PromptMessage, PromptRole};
 use super::store::{ChatStore, HISTORY_READ_CAP};
 use crate::context::compaction_thresholds;
 use crate::settings::CompactionSettings;
@@ -108,6 +109,8 @@ pub struct TurnSettings {
     pub system_addition: String,
     /// When and how far history is compacted.
     pub compaction: CompactionSettings,
+    /// Whether the fixed prompt prefix is saved and reused between runs.
+    pub persist_prefix_cache: bool,
 }
 
 /// Builds an engine from a configuration; the Tauri layer supplies the real
@@ -164,8 +167,14 @@ impl ChatService {
     /// Starts the worker thread.
     ///
     /// The worker owns the engine and opens the history store at `db_path` the
-    /// first time it needs it. Every state change is passed to `status_sink`.
-    pub fn spawn(db_path: PathBuf, factory: EngineFactory, status_sink: StatusSink) -> ChatService {
+    /// first time it needs it. Persisted prefix states are kept under
+    /// `prefix_cache_dir`. Every state change is passed to `status_sink`.
+    pub fn spawn(
+        db_path: PathBuf,
+        prefix_cache_dir: PathBuf,
+        factory: EngineFactory,
+        status_sink: StatusSink,
+    ) -> ChatService {
         let status = Arc::new(Mutex::new(ChatStatus {
             state: ChatState::Stopped,
             error: None,
@@ -190,6 +199,10 @@ impl ChatService {
                     store: None,
                     last_settings: None,
                     pending: VecDeque::new(),
+                    prefix_cache: PrefixCache::new(prefix_cache_dir),
+                    started_config: None,
+                    prefix_load_tried: false,
+                    prefix_saved: false,
                 }
                 .run(incoming);
             })
@@ -340,6 +353,14 @@ struct Worker {
     last_settings: Option<TurnSettings>,
     /// Commands picked up while an idle pass was starting.
     pending: VecDeque<Command>,
+    /// Where persisted prefix states live.
+    prefix_cache: PrefixCache,
+    /// The configuration the engine was started with, kept for the prefix key.
+    started_config: Option<EngineConfig>,
+    /// Whether this session has tried to load the prefix cache.
+    prefix_load_tried: bool,
+    /// Whether this session already has the prefix state in the cache.
+    prefix_saved: bool,
 }
 
 impl Worker {
@@ -426,6 +447,9 @@ impl Worker {
         match (self.factory)(config) {
             Ok(engine) => {
                 self.engine = Some(engine);
+                self.started_config = Some(config.clone());
+                self.prefix_load_tried = false;
+                self.prefix_saved = false;
                 self.set_status(ChatState::Ready, None);
                 Ok(())
             }
@@ -541,14 +565,14 @@ impl Worker {
             &settings.compaction,
         )
         .trigger as usize;
-        if self.next_plan(&settings, trigger).is_none() {
-            return;
+        if self.next_plan(&settings, trigger).is_some() {
+            self.set_status(ChatState::Compacting, None);
+            let cancel = Arc::clone(&self.idle_cancel);
+            self.compact(&settings, trigger, &cancel);
+            self.set_status(ChatState::Ready, None);
         }
 
-        self.set_status(ChatState::Compacting, None);
-        let cancel = Arc::clone(&self.idle_cancel);
-        self.compact(&settings, trigger, &cancel);
-        self.set_status(ChatState::Ready, None);
+        self.save_prefix_cache(&settings);
     }
 
     /// Runs one turn and streams its events to `events`.
@@ -616,6 +640,11 @@ impl Worker {
             context_tokens,
             &|piece| engine.count_tokens(piece),
         );
+
+        if settings.persist_prefix_cache && !self.prefix_load_tried {
+            self.prefix_load_tried = true;
+            self.maybe_load_prefix(settings);
+        }
 
         let cancel = Arc::clone(&self.cancel);
         let mut reply = String::new();
@@ -687,12 +716,91 @@ impl Worker {
         turn
     }
 
+    /// Loads the persisted prefix state on the first turn of a session, when
+    /// the engine supports it. Failures are silent: the turn simply decodes
+    /// the prefix as usual.
+    fn maybe_load_prefix(&mut self, settings: &TurnSettings) {
+        let Some(identity) = self
+            .engine
+            .as_ref()
+            .and_then(|engine| engine.cache_identity())
+        else {
+            return;
+        };
+        let Some(model_path) = self
+            .started_config
+            .as_ref()
+            .map(|config| config.model_path.clone())
+        else {
+            return;
+        };
+        let prefix = prefix_messages(settings);
+        let Ok(key) = PrefixKey::new(&model_path, &identity, &prefix[0].text) else {
+            return;
+        };
+        let Some(path) = self.prefix_cache.lookup(&key) else {
+            return;
+        };
+        if let Some(engine) = self.engine.as_mut() {
+            if matches!(engine.load_prefix(&prefix, &path), Ok(true)) {
+                self.prefix_saved = true;
+            }
+        }
+    }
+
+    /// Saves the prefix state at most once per session, in the idle window
+    /// after a reply. Failures are silent and never change the chat state.
+    fn save_prefix_cache(&mut self, settings: &TurnSettings) {
+        if !settings.persist_prefix_cache
+            || self.prefix_saved
+            || self.idle_cancel.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        let Some(identity) = self
+            .engine
+            .as_ref()
+            .and_then(|engine| engine.cache_identity())
+        else {
+            return;
+        };
+        let Some(model_path) = self
+            .started_config
+            .as_ref()
+            .map(|config| config.model_path.clone())
+        else {
+            return;
+        };
+        let prefix = prefix_messages(settings);
+        let Ok(key) = PrefixKey::new(&model_path, &identity, &prefix[0].text) else {
+            return;
+        };
+        self.prefix_saved = true;
+        if self.prefix_cache.lookup(&key).is_some() {
+            return;
+        }
+        let Some(engine) = self.engine.as_mut() else {
+            return;
+        };
+        let _ = self.prefix_cache.store(&key, &mut |path| {
+            engine.save_prefix(&prefix, path).map_err(|error| error.0)
+        });
+    }
+
     /// Reads stored history, opening the store if needed.
     fn history(&mut self, limit: usize) -> Result<Vec<ChatMessage>, String> {
         self.store_mut()?
             .recent(limit)
             .map_err(|error| error.to_string())
     }
+}
+
+/// The fixed prompt prefix for `settings`: the system message alone.
+fn prefix_messages(settings: &TurnSettings) -> Vec<PromptMessage> {
+    vec![PromptMessage {
+        role: PromptRole::System,
+        text: system_text(&settings.system_addition),
+    }]
 }
 
 /// The history database path for a test directory.
@@ -761,8 +869,12 @@ mod tests {
         }
     }
 
+    fn prefix_dir(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("kv")
+    }
+
     fn service(dir: &tempfile::TempDir, factory: EngineFactory) -> ChatService {
-        ChatService::spawn(db_path(dir), factory, Box::new(|_| {}))
+        ChatService::spawn(db_path(dir), prefix_dir(dir), factory, Box::new(|_| {}))
     }
 
     fn states(statuses: &Arc<Mutex<Vec<ChatStatus>>>) -> Vec<ChatState> {
@@ -819,7 +931,12 @@ mod tests {
     fn start_then_send_streams_tokens_and_saves_both_messages() {
         let dir = tempfile::tempdir().expect("temp dir");
         let (sink, statuses) = recording_sink();
-        let service = ChatService::spawn(db_path(&dir), piece_factory(&["Hello", " there"]), sink);
+        let service = ChatService::spawn(
+            db_path(&dir),
+            prefix_dir(&dir),
+            piece_factory(&["Hello", " there"]),
+            sink,
+        );
 
         service
             .start(Some(config(&dir)))
@@ -1054,7 +1171,7 @@ mod tests {
             })
         };
         let (sink, statuses) = recording_sink();
-        let service = ChatService::spawn(db_path(&dir), factory, sink);
+        let service = ChatService::spawn(db_path(&dir), prefix_dir(&dir), factory, sink);
         service.start(Some(config(&dir))).expect("start");
 
         // The system message costs 34 words + 4 template tokens, so after four
@@ -1116,7 +1233,7 @@ mod tests {
                 ))
             })
         };
-        let service = ChatService::spawn(path.clone(), factory, Box::new(|_| {}));
+        let service = ChatService::spawn(path.clone(), prefix_dir(&dir), factory, Box::new(|_| {}));
         service.start(Some(config(&dir))).expect("start");
 
         let mut events = Vec::new();
@@ -1301,7 +1418,7 @@ mod tests {
             })
         };
         let (sink, statuses) = recording_sink();
-        let service = ChatService::spawn(db_path(&dir), factory, sink);
+        let service = ChatService::spawn(db_path(&dir), prefix_dir(&dir), factory, sink);
 
         let config = config(&dir);
         assert_eq!(
@@ -1326,5 +1443,145 @@ mod tests {
                 ChatState::Ready
             ]
         );
+    }
+
+    /// Settings with prefix persistence on.
+    fn prefix_settings() -> TurnSettings {
+        TurnSettings {
+            persist_prefix_cache: true,
+            ..TurnSettings::default()
+        }
+    }
+
+    /// A factory whose engine has a prefix cache logging into `log`.
+    fn prefix_factory(log: &Arc<Mutex<Vec<String>>>) -> EngineFactory {
+        let log = Arc::clone(log);
+        Box::new(move |_config| {
+            Ok(Box::new(
+                FakeEngine::new(vec!["ok".to_string()], 4096).with_prefix_cache(Arc::clone(&log)),
+            ))
+        })
+    }
+
+    fn log_entries(log: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        log.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Waits up to 5 s for the idle pass to log `needle`.
+    fn wait_for_log(log: &Arc<Mutex<Vec<String>>>, needle: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if log_entries(log).iter().any(|entry| entry == needle) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        log_entries(log).iter().any(|entry| entry == needle)
+    }
+
+    fn state_files(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("state"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn wait_for_state_files(dir: &Path) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if !state_files(dir).is_empty() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        !state_files(dir).is_empty()
+    }
+
+    #[test]
+    fn a_prefix_cache_is_saved_then_loaded_by_a_new_session() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let kv = prefix_dir(&dir);
+        let config = config(&dir);
+
+        let first_log = Arc::new(Mutex::new(Vec::new()));
+        {
+            let service = ChatService::spawn(
+                db_path(&dir),
+                kv.clone(),
+                prefix_factory(&first_log),
+                Box::new(|_| {}),
+            );
+            service.start(Some(config.clone())).expect("start");
+            service
+                .send("hi", &prefix_settings(), &mut |_| {})
+                .expect("send");
+
+            assert!(
+                wait_for_log(&first_log, "save"),
+                "the first session should save its prefix: {:?}",
+                log_entries(&first_log)
+            );
+            assert!(
+                wait_for_state_files(&kv),
+                "a persisted state file should exist"
+            );
+        }
+
+        let second_log = Arc::new(Mutex::new(Vec::new()));
+        let service = ChatService::spawn(
+            db_path(&dir),
+            kv.clone(),
+            prefix_factory(&second_log),
+            Box::new(|_| {}),
+        );
+        service.start(Some(config)).expect("start");
+
+        let mut at_first_token = None;
+        service
+            .send("again", &prefix_settings(), &mut |event| {
+                if at_first_token.is_none() && matches!(event, ChatEvent::Token { .. }) {
+                    at_first_token = Some(log_entries(&second_log));
+                }
+            })
+            .expect("send");
+
+        let at_first_token = at_first_token.expect("a Token event");
+        assert!(
+            at_first_token.iter().any(|entry| entry == "load:true"),
+            "the prefix should load before the reply: {at_first_token:?}"
+        );
+    }
+
+    #[test]
+    fn the_prefix_cache_stays_empty_when_persistence_is_off() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let kv = prefix_dir(&dir);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let service = ChatService::spawn(
+            db_path(&dir),
+            kv.clone(),
+            prefix_factory(&log),
+            Box::new(|_| {}),
+        );
+        service.start(Some(config(&dir))).expect("start");
+
+        service
+            .send("hi", &TurnSettings::default(), &mut |_| {})
+            .expect("send");
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert!(
+            log_entries(&log).is_empty(),
+            "no prefix work should run: {:?}",
+            log_entries(&log)
+        );
+        assert!(state_files(&kv).is_empty());
     }
 }
