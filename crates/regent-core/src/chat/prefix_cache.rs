@@ -16,6 +16,8 @@ use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
 
+use crate::hash::fnv1a64;
+
 /// The engine traits a cache entry is only valid for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheIdentity {
@@ -205,16 +207,6 @@ impl PrefixCache {
         let encoded = toml::to_string(key).unwrap_or_default();
         format!("{:016x}", fnv1a64(encoded.as_bytes()))
     }
-}
-
-/// A hand-written FNV-1a 64-bit hash.
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for &byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 fn string_error(error: impl std::fmt::Display) -> String {
