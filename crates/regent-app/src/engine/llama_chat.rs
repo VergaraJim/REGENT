@@ -7,6 +7,7 @@
 //! Summaries run on a temporary second context so they never evict that cache.
 
 use std::num::NonZeroU32;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -19,12 +20,16 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 use regent_core::chat::SUMMARY_TEMPERATURE;
 use regent_core::chat::{
-    ChatEngine, ChatEngineError, EngineConfig, GenerationStats, Outcome, PromptMessage, PromptRole,
-    REPLY_RESERVE_TOKENS,
+    CacheIdentity, ChatEngine, ChatEngineError, EngineConfig, GenerationStats, Outcome,
+    PromptMessage, PromptRole, REPLY_RESERVE_TOKENS,
 };
 use regent_core::context::{clamp_requested, context_limits, MIN_CONTEXT};
 
 use super::llama::backend;
+
+/// Bump this whenever the `llama-cpp-2` crate version changes: the KV state
+/// format is tied to it, so a saved state must not outlive the version.
+const ENGINE_VERSION: &str = "llama-cpp-2 0.1.161";
 
 /// The fixed seed keeps a replay of the same prompt reproducible.
 const SAMPLE_SEED: u32 = 0x5EED_1234;
@@ -145,6 +150,28 @@ impl LlamaChatEngine {
     fn model(&self) -> &LlamaModel {
         &self._model
     }
+
+    /// The fixed opening of `prefix` as model tokens, or an empty vector when
+    /// it cannot be told apart from the rest of the prompt.
+    ///
+    /// Some templates merge the system text into the first user turn, so
+    /// rendering the prefix alone is not reliable. Rendering it with two
+    /// different user turns instead and keeping what both renderings share
+    /// isolates the tokens that belong to the prefix.
+    fn prefix_tokens(&self, prefix: &[PromptMessage]) -> Vec<LlamaToken> {
+        let with_user = |text: &str| {
+            let mut messages = prefix.to_vec();
+            messages.push(PromptMessage {
+                role: PromptRole::User,
+                text: text.to_string(),
+            });
+            self.tokenize_prompt(&self.render_prompt(&messages))
+        };
+        let first = with_user("a");
+        let second = with_user("b");
+        let shared = common_prefix_len(&first, &second);
+        first[..shared].to_vec()
+    }
 }
 
 impl ChatEngine for LlamaChatEngine {
@@ -157,6 +184,81 @@ impl ChatEngine for LlamaChatEngine {
 
     fn context_tokens(&self) -> usize {
         self.context_size
+    }
+
+    fn cache_identity(&self) -> Option<CacheIdentity> {
+        let chat_template = self
+            .model()
+            .chat_template(None)
+            .ok()
+            .and_then(|template| template.to_str().ok().map(str::to_string))
+            .unwrap_or_else(|| "chatml-fallback".to_string());
+        Some(CacheIdentity {
+            // The context keeps llama.cpp's default KV cache type, f16.
+            kv_type: "f16".to_string(),
+            chat_template,
+            engine_version: ENGINE_VERSION.to_string(),
+            context_size: self.context_size,
+        })
+    }
+
+    /// Saves the KV state for the fixed `prefix` to `path`.
+    ///
+    /// The cache is trimmed to the prefix the first time this runs, so the
+    /// tokens decoded after the prefix have to be decoded once more on the
+    /// next turn; that trim happens at most once per saved state.
+    fn save_prefix(
+        &mut self,
+        prefix: &[PromptMessage],
+        path: &Path,
+    ) -> Result<(), ChatEngineError> {
+        let tokens = self.prefix_tokens(prefix);
+        if tokens.is_empty() || !self.cached.starts_with(&tokens) {
+            return Err(ChatEngineError(
+                "The prompt cache isn't ready to save.".to_string(),
+            ));
+        }
+
+        if self.cached.len() > tokens.len() {
+            let trim = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
+            if self.context.kv_cache_seq_rm(0, Some(trim), None).is_err() {
+                return Err(ChatEngineError(
+                    "The prompt cache isn't ready to save.".to_string(),
+                ));
+            }
+            self.cached.truncate(tokens.len());
+        }
+
+        self.context
+            .state_seq_save_file(path, 0, &tokens)
+            .map_err(|_| ChatEngineError("Regent couldn't save its prompt cache.".to_string()))?;
+        Ok(())
+    }
+
+    fn load_prefix(
+        &mut self,
+        prefix: &[PromptMessage],
+        path: &Path,
+    ) -> Result<bool, ChatEngineError> {
+        let tokens = self.prefix_tokens(prefix);
+        if tokens.is_empty() {
+            return Ok(false);
+        }
+
+        self.context.clear_kv_cache();
+        self.cached.clear();
+
+        match self.context.state_seq_load_file(path, 0, self.context_size) {
+            Ok((loaded, _)) if loaded == tokens => {
+                self.cached = loaded;
+                Ok(true)
+            }
+            // A bad or mismatched state file is never an error the user sees.
+            _ => {
+                self.context.clear_kv_cache();
+                Ok(false)
+            }
+        }
     }
 
     fn generate(
