@@ -236,6 +236,7 @@ export type ChatState =
   | "loading"
   | "ready"
   | "generating"
+  | "compacting"
   | "error";
 
 /** One stored turn in the conversation. */
@@ -255,12 +256,17 @@ export interface ChatStateEvent {
 
 export interface GenerationStats {
   prompt_tokens: number;
+  /** Prompt tokens whose KV cache was reused instead of recomputed. */
+  reused_tokens: number;
+  /** Prompt tokens the model actually processed for this turn. */
+  processed_tokens: number;
   generated_tokens: number;
   tokens_per_second: number;
 }
 
 /** One event streamed back over the `send_message` channel. */
 export type ChatEvent =
+  | { type: "compacting" }
   | { type: "token"; text: string }
   | { type: "done"; message_id: number; stats: GenerationStats }
   | { type: "cancelled"; message_id: number | null }

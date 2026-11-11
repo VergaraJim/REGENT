@@ -18,7 +18,14 @@ export function ChatView({
   textModelSet,
   onOpenSettings,
 }: ChatViewProps) {
-  const { messages, chatState, error, turnError, streamingText } = controller;
+  const {
+    messages,
+    chatState,
+    error,
+    turnError,
+    streamingText,
+    compactingReply,
+  } = controller;
   const listRef = useRef<HTMLDivElement>(null);
   const nearBottom = useRef(true);
 
@@ -62,7 +69,16 @@ export function ChatView({
               />
             ))}
             {streamingText !== null ? (
-              <MessageBubble role="assistant" text={streamingText} streaming />
+              <MessageBubble
+                role="assistant"
+                text={streamingText}
+                streaming
+                placeholder={
+                  compactingReply && streamingText === ""
+                    ? "Compacting…"
+                    : undefined
+                }
+              />
             ) : null}
           </>
         )}
@@ -99,8 +115,17 @@ export function ChatView({
             Regent is stopped. Press Start to continue.
           </p>
         ) : null}
+        {chatState === "compacting" ? (
+          <div
+            role="status"
+            className="flex items-center gap-2 text-xs text-muted"
+          >
+            <Spinner size="sm" />
+            <span>Compacting…</span>
+          </div>
+        ) : null}
         <Composer
-          disabled={chatState !== "ready"}
+          disabled={chatState !== "ready" && chatState !== "compacting"}
           generating={chatState === "generating"}
           onSend={controller.send}
           onCancel={controller.cancel}

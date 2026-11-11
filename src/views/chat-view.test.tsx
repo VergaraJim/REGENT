@@ -14,6 +14,7 @@ function controller(
     error: null,
     turnError: null,
     streamingText: null,
+    compactingReply: false,
     start: () => {},
     stop: () => {},
     send: () => {},
@@ -104,5 +105,34 @@ describe("ChatView markup", () => {
     );
     expect(html).toContain('aria-label="Cancel"');
     expect(html).toContain("Partial");
+  });
+
+  it("shows idle compaction and keeps the composer enabled", () => {
+    const html = render(controller("compacting", { messages }));
+    expect(html).toContain('role="status"');
+    expect(html).toContain("Compacting…");
+    expect(html).toContain('aria-label="Send"');
+
+    const textarea = /<textarea[^>]*aria-label="Message"[^>]*>/.exec(html)?.[0];
+    expect(textarea).toBeTruthy();
+    expect(textarea).not.toContain("disabled");
+  });
+
+  it("shows compaction inside the reply bubble before the first token", () => {
+    const html = render(
+      controller("ready", {
+        messages,
+        streamingText: "",
+        compactingReply: true,
+      }),
+    );
+    expect(html.match(/Compacting…/g)).toHaveLength(1);
+
+    const log = html.indexOf('role="log"');
+    const hint = html.indexOf("Compacting…");
+    const composer = html.indexOf('aria-label="Message"');
+    expect(log).toBeGreaterThanOrEqual(0);
+    expect(hint).toBeGreaterThan(log);
+    expect(hint).toBeLessThan(composer);
   });
 });

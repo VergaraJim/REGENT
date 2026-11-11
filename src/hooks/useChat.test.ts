@@ -108,7 +108,13 @@ describe("useChat", () => {
     await emit({
       type: "done",
       message_id: 7,
-      stats: { prompt_tokens: 1, generated_tokens: 2, tokens_per_second: 5 },
+      stats: {
+        prompt_tokens: 1,
+        reused_tokens: 0,
+        processed_tokens: 1,
+        generated_tokens: 2,
+        tokens_per_second: 5,
+      },
     });
 
     expect(chat.current().streamingText).toBeNull();
@@ -121,6 +127,47 @@ describe("useChat", () => {
       role: "assistant",
     });
     expect(chat.current().chatState).toBe("ready");
+    chat.unmount();
+  });
+
+  it("marks the reply as compacting until the first token arrives", async () => {
+    const chat = await mount({ state: "ready", error: null });
+
+    await act(async () => {
+      chat.current().send("Hello");
+    });
+    expect(chat.current().compactingReply).toBe(false);
+
+    await emit({ type: "compacting" });
+    expect(chat.current().compactingReply).toBe(true);
+
+    await emit({ type: "token", text: "H" });
+    expect(chat.current().compactingReply).toBe(false);
+    chat.unmount();
+  });
+
+  it("clears compacting when the turn ends without tokens", async () => {
+    const chat = await mount({ state: "ready", error: null });
+
+    await act(async () => {
+      chat.current().send("Hello");
+    });
+    await emit({ type: "compacting" });
+    await emit({ type: "cancelled", message_id: null });
+
+    expect(chat.current().compactingReply).toBe(false);
+    chat.unmount();
+  });
+
+  it("accepts a send while idle compaction is running", async () => {
+    const chat = await mount({ state: "compacting", error: null });
+
+    await act(async () => {
+      chat.current().send("Hello");
+    });
+
+    expect(api.sendMessage).toHaveBeenCalledWith("Hello", expect.any(Function));
+    expect(chat.current().chatState).toBe("generating");
     chat.unmount();
   });
 
