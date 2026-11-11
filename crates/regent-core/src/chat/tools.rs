@@ -85,6 +85,21 @@ decisions or anything the user said before.",
     }
 }
 
+/// The spec of the `look_at_screen` tool.
+pub fn look_at_screen_spec() -> ToolSpec {
+    ToolSpec {
+        name: "look_at_screen",
+        description:
+            "Look at the user's screen right now and answer a question about what is on it.",
+        params: vec![ParamSpec {
+            name: "question",
+            kind: ParamKind::Text,
+            required: true,
+            description: "What to find out from the screen.",
+        }],
+    }
+}
+
 /// The constant tools section of the system prompt.
 ///
 /// The output depends only on the specs, never on runtime values, so the
@@ -426,6 +441,15 @@ mod tests {
             "{section}"
         );
         assert!(section.contains("query: What to look for."), "{section}");
+    }
+
+    #[test]
+    fn tools_section_contains_the_look_at_screen_line() {
+        let section = tools_section(&[look_at_screen_spec()]);
+        assert!(
+            section.contains("- look_at_screen(question: text)"),
+            "{section}"
+        );
     }
 
     #[test]

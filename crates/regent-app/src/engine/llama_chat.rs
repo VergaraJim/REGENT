@@ -21,7 +21,7 @@ use llama_cpp_2::token::LlamaToken;
 use regent_core::chat::SUMMARY_TEMPERATURE;
 use regent_core::chat::{
     CacheIdentity, ChatEngine, ChatEngineError, EngineConfig, GenerationStats, Outcome,
-    PromptMessage, PromptRole, REPLY_RESERVE_TOKENS,
+    PromptMessage, PromptRole, REPLY_RESERVE_TOKENS, THINK_CLOSE, THINK_OPEN,
 };
 use regent_core::context::{clamp_requested, context_limits, MIN_CONTEXT};
 
@@ -121,6 +121,7 @@ impl LlamaChatEngine {
     /// Renders with the template stored in the model, if there is one.
     fn render_with_template(&self, prompt: &[PromptMessage]) -> Option<String> {
         let template = self.model().chat_template(None).ok()?;
+        let template_text = self.template_text();
         let messages: Vec<LlamaChatMessage> = prompt
             .iter()
             .map(|message| {
@@ -128,10 +129,20 @@ impl LlamaChatEngine {
                     .ok()
             })
             .collect::<Option<Vec<_>>>()?;
-        self.model()
+        let rendered = self
+            .model()
             .apply_chat_template(&template, &messages, true)
             .ok()
-            .filter(|text| !text.is_empty())
+            .filter(|text| !text.is_empty())?;
+        Some(without_thinking(rendered, template_text.as_deref()))
+    }
+
+    /// The model's own chat template as text, when it has a readable one.
+    fn template_text(&self) -> Option<String> {
+        self.model()
+            .chat_template(None)
+            .ok()
+            .and_then(|template| template.to_str().ok().map(str::to_string))
     }
 
     /// Tokenises a rendered prompt, adding BOS only when the template did not
@@ -563,8 +574,34 @@ fn chatml_prompt(prompt: &[PromptMessage]) -> String {
     text
 }
 
+/// Closes a rendered prompt so a hybrid model answers without reasoning.
+///
+/// Qwen3's template switches thinking off by priming the assistant turn with
+/// `<think\n\n</think\n\n`. A template that never mentions `<think` is left
+/// unchanged, and so is a prompt that is already closed.
+pub(crate) fn without_thinking(rendered: String, template: Option<&str>) -> String {
+    let Some(template) = template else {
+        return rendered;
+    };
+    if !template.contains(THINK_OPEN) {
+        return rendered;
+    }
+    let trimmed = rendered.trim_end();
+    if trimmed.ends_with(THINK_CLOSE) {
+        return rendered;
+    }
+    let mut out = trimmed.to_string();
+    if !trimmed.ends_with(THINK_OPEN) {
+        out.push_str(THINK_OPEN);
+    }
+    out.push_str("\n\n");
+    out.push_str(THINK_CLOSE);
+    out.push_str("\n\n");
+    out
+}
+
 /// Hands complete UTF-8 text to `on_token`, holding partial characters back.
-fn flush_text(buffer: &mut Vec<u8>, on_token: &mut dyn FnMut(&str)) {
+pub(crate) fn flush_text(buffer: &mut Vec<u8>, on_token: &mut dyn FnMut(&str)) {
     loop {
         match std::str::from_utf8(buffer) {
             Ok(text) => {
@@ -629,5 +666,42 @@ mod tests {
         assert_eq!(summarizer_context_size(1000, 100, 4096), Some(1280));
         assert_eq!(summarizer_context_size(1000, 100, 1280), Some(1280));
         assert_eq!(summarizer_context_size(1000, 100, 1279), None);
+    }
+
+    #[test]
+    fn without_thinking_leaves_other_templates_alone() {
+        assert_eq!(without_thinking("prompt".to_string(), None), "prompt");
+        assert_eq!(
+            without_thinking("prompt".to_string(), Some("<|im_start|>assistant")),
+            "prompt"
+        );
+    }
+
+    #[test]
+    fn without_thinking_keeps_a_closed_prompt() {
+        let closed = format!("prompt{THINK_OPEN}\n\n{THINK_CLOSE}\n\n");
+        assert_eq!(without_thinking(closed.clone(), Some(THINK_OPEN)), closed);
+    }
+
+    #[test]
+    fn without_thinking_completes_an_open_block() {
+        let expected = format!("prompt{THINK_OPEN}\n\n{THINK_CLOSE}\n\n");
+        assert_eq!(
+            without_thinking(format!("prompt{THINK_OPEN}"), Some(THINK_OPEN)),
+            expected
+        );
+        assert_eq!(
+            without_thinking(format!("prompt{THINK_OPEN}\n"), Some(THINK_OPEN)),
+            expected
+        );
+    }
+
+    #[test]
+    fn without_thinking_appends_a_closed_block() {
+        let expected = format!("prompt{THINK_OPEN}\n\n{THINK_CLOSE}\n\n");
+        assert_eq!(
+            without_thinking("prompt".to_string(), Some(THINK_OPEN)),
+            expected
+        );
     }
 }

@@ -150,6 +150,8 @@ impl AppState {
             memory_sink: Box::new(move |status| {
                 let _ = memory_app.emit(MEMORY_STATUS, status);
             }),
+            // Wired to the real vision service by a later task.
+            vision: None,
         });
 
         let resource_dir = app.path().resource_dir().ok();

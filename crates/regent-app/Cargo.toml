@@ -14,7 +14,7 @@ tauri-build = { version = "2", features = [] }
 
 [features]
 default = ["llama", "audio"]
-llama = ["dep:llama-cpp-2"]
+llama = ["dep:llama-cpp-2", "llama-cpp-2/mtmd"]
 audio = ["dep:cpal"]
 
 [dev-dependencies]
