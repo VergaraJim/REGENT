@@ -133,6 +133,8 @@ pub trait ChatEngine: Send {
 /// without a real model.
 pub struct FakeEngine {
     pieces: Vec<String>,
+    rounds: Option<Vec<Vec<String>>>,
+    round: usize,
     context_tokens: usize,
     fail: Option<String>,
     summaries: Vec<String>,
@@ -146,6 +148,8 @@ impl FakeEngine {
     pub fn new(pieces: Vec<String>, context_tokens: usize) -> FakeEngine {
         FakeEngine {
             pieces,
+            rounds: None,
+            round: 0,
             context_tokens,
             fail: None,
             summaries: Vec::new(),
@@ -158,12 +162,22 @@ impl FakeEngine {
     pub fn failing(message: impl Into<String>) -> FakeEngine {
         FakeEngine {
             pieces: Vec::new(),
+            rounds: None,
+            round: 0,
             context_tokens: 4096,
             fail: Some(message.into()),
             summaries: Vec::new(),
             prompts: None,
             prefix_cache: None,
         }
+    }
+
+    /// Emits one round of pieces per [`ChatEngine::generate`] call, in order;
+    /// the last round repeats once it is reached.
+    pub fn with_rounds(mut self, rounds: Vec<Vec<String>>) -> Self {
+        self.rounds = Some(rounds);
+        self.round = 0;
+        self
     }
 
     /// The summaries this engine hands out, one per [`ChatEngine::summarize`]
@@ -228,8 +242,17 @@ impl ChatEngine for FakeEngine {
 
         self.record(prompt);
 
+        let round = self.round;
+        let pieces = match &self.rounds {
+            Some(rounds) if !rounds.is_empty() => {
+                self.round += 1;
+                rounds[round.min(rounds.len() - 1)].as_slice()
+            }
+            _ => self.pieces.as_slice(),
+        };
+
         let mut generated = String::new();
-        for piece in &self.pieces {
+        for piece in pieces {
             if cancel.load(Ordering::SeqCst) {
                 return Ok(Outcome::Cancelled(stats_for(prompt, &generated)));
             }

@@ -5,7 +5,7 @@
 //! shared atomic flag, so [`ChatService::cancel`] works while a reply is
 //! streaming. Every state change is reported through the status sink.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -21,14 +21,19 @@ use super::compaction::{
 use super::engine::{ChatEngine, ChatEngineError, EngineConfig, GenerationStats, Outcome};
 use super::message::{ChatMessage, Role};
 use super::prefix_cache::{PrefixCache, PrefixKey};
-use super::prompt::{build_prompt, system_text, PromptMessage, PromptRole};
+use super::prompt::{build_prompt, fixed_prefix, PromptMessage, PromptRole};
 use super::store::{ChatStore, HISTORY_READ_CAP};
+use super::tools::{
+    search_memory_spec, tools_section, validate_call, ToolCallParser, ToolSpec, ANSWER_NOW,
+    MAX_TOOL_CALLS_PER_TURN,
+};
 use crate::context::compaction_thresholds;
 use crate::memory::engine::{EmbeddingConfig, EmbeddingEngine, EmbeddingFactory};
 use crate::memory::status::{MemorySink, MemoryState, MemoryStatus};
 use crate::memory::vector::{normalize, VectorIndex};
 use crate::memory::{
-    chunk_text, model_id, resolve_markers, Markers, INDEX_BATCH, MAX_INDEX_FAILURES,
+    chunk_text, format_recall, model_id, resolve_markers, Markers, DEFAULT_RECALL_LIMIT,
+    INDEX_BATCH, MAX_INDEX_FAILURES, NOTHING_INDEXED, NO_MATCHES,
 };
 use crate::settings::CompactionSettings;
 
@@ -97,6 +102,11 @@ pub enum ChatEvent {
     Token {
         /// The piece of text.
         text: String,
+    },
+    /// A valid tool call ran; its result is stored for the next round.
+    Tool {
+        /// The tool that ran.
+        name: String,
     },
     /// Older turns are being folded into a summary before the reply.
     Compacting,
@@ -715,7 +725,7 @@ impl Worker {
     /// Plans the next compaction pass for `threshold`, or `None` when the
     /// working prompt is small enough or too little history exists.
     fn next_plan(&mut self, settings: &TurnSettings, threshold: usize) -> Option<CompactionPlan> {
-        let system = system_text(&settings.system_addition);
+        let system = self.prefix_text(settings);
         let (summary, messages) = self.working_memory().ok()?;
         let engine = self.engine.as_ref()?;
         let context_tokens = engine.context_tokens();
@@ -927,6 +937,25 @@ impl Worker {
         }
     }
 
+    /// The tools available this turn: `search_memory` while a memory runtime
+    /// is loaded, whatever its state, and none otherwise.
+    fn tools(&self) -> Vec<ToolSpec> {
+        if self.memory_runtime.is_some() {
+            vec![search_memory_spec()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The fixed prompt prefix for `settings`: the system prompt plus the tools
+    /// section when tools are available.
+    ///
+    /// This is used for the prompt, the compaction maths and the persisted
+    /// prefix cache, so all three agree on exactly what is sent first.
+    fn prefix_text(&self, settings: &TurnSettings) -> String {
+        fixed_prefix(&settings.system_addition, &tools_section(&self.tools()))
+    }
+
     /// Runs one turn and streams its events to `events`.
     fn send(
         &mut self,
@@ -953,7 +982,7 @@ impl Worker {
 
         self.set_status(ChatState::Generating, None);
 
-        let system = system_text(&settings.system_addition);
+        let system = self.prefix_text(settings);
         let context_tokens = match self.engine.as_ref() {
             Some(engine) => engine.context_tokens(),
             None => return Err(NOT_STARTED.to_string()),
@@ -964,7 +993,7 @@ impl Worker {
         )
         .hard_limit as usize;
 
-        let (mut summary, mut messages) = self.working_memory()?;
+        let (summary, messages) = self.working_memory()?;
         let too_big = match self.engine.as_ref() {
             Some(engine) => {
                 working_memory_tokens(&system, summary.as_deref(), &messages, &|piece| {
@@ -977,50 +1006,115 @@ impl Worker {
             let _ = events.send(TurnMessage::Event(ChatEvent::Compacting));
             let cancel = Arc::clone(&self.cancel);
             self.compact(settings, hard_limit, &cancel);
-            let (next_summary, next_messages) = self.working_memory()?;
-            summary = next_summary;
-            messages = next_messages;
         }
-
-        let Some(engine) = self.engine.as_ref() else {
-            return Err(NOT_STARTED.to_string());
-        };
-        let prompt = build_prompt(
-            &settings.system_addition,
-            "",
-            summary.as_deref(),
-            &messages,
-            context_tokens,
-            &|piece| engine.count_tokens(piece),
-        );
 
         if settings.persist_prefix_cache && !self.prefix_load_tried {
             self.prefix_load_tried = true;
             self.maybe_load_prefix(settings);
         }
 
-        let cancel = Arc::clone(&self.cancel);
-        let mut reply = String::new();
-        let outcome = match self.engine.as_mut() {
-            Some(engine) => engine.generate(&prompt, &cancel, &mut |piece| {
-                reply.push_str(piece);
-                let _ = events.send(TurnMessage::Event(ChatEvent::Token {
-                    text: piece.to_string(),
-                }));
-                // Wait for the caller to hand the piece to `on_event`, which
-                // may cancel the turn, before producing the next one.
-                if acks.recv().is_err() {
-                    cancel.store(true, Ordering::SeqCst);
-                }
-            }),
-            None => return Err(NOT_STARTED.to_string()),
-        };
+        let tools = self.tools();
+        let tools_section = tools_section(&tools);
+        let mut calls = 0usize;
+        // The turn runs round after round: a round ends when the model completes
+        // a tool call, whose result is appended before the next round. The
+        // closing round (no call, or a call once the budget is spent) keeps the
+        // tools section in the prompt so the cached prefix stays valid, but any
+        // further call it makes is dropped.
+        let turn: Result<(), String> = loop {
+            // Re-read the working memory each round: tool rows were appended
+            // between rounds.
+            let (summary, messages) = self.working_memory()?;
+            let Some(engine) = self.engine.as_ref() else {
+                return Err(NOT_STARTED.to_string());
+            };
+            let prompt = build_prompt(
+                &settings.system_addition,
+                &tools_section,
+                summary.as_deref(),
+                &messages,
+                context_tokens,
+                &|piece| engine.count_tokens(piece),
+            );
+            let window_ids: HashSet<i64> = messages.iter().map(|message| message.id).collect();
 
-        let turn = match outcome {
-            Ok(Outcome::Finished(stats)) => {
+            // A fresh stop flag per round: a completed call, or the user's
+            // cancel, stops only this round.
+            let round_stop = AtomicBool::new(false);
+            let cancel = Arc::clone(&self.cancel);
+            let mut parser = ToolCallParser::new();
+            let mut visible = String::new();
+            let mut call: Option<String> = None;
+            let outcome = match self.engine.as_mut() {
+                Some(engine) => engine.generate(&prompt, &round_stop, &mut |piece| {
+                    let parsed = parser.push(piece);
+                    if !parsed.visible.is_empty() {
+                        visible.push_str(&parsed.visible);
+                        let _ = events.send(TurnMessage::Event(ChatEvent::Token {
+                            text: parsed.visible,
+                        }));
+                        // Wait for the caller to hand the piece to `on_event`,
+                        // which may cancel the turn, before producing the next
+                        // one.
+                        if acks.recv().is_err() {
+                            cancel.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    if let Some(found) = parsed.call {
+                        call = Some(found);
+                        round_stop.store(true, Ordering::SeqCst);
+                    }
+                    if cancel.load(Ordering::SeqCst) {
+                        round_stop.store(true, Ordering::SeqCst);
+                    }
+                }),
+                None => return Err(NOT_STARTED.to_string()),
+            };
+
+            if call.is_none() {
+                let tail = parser.finish();
+                if !tail.is_empty() {
+                    visible.push_str(&tail);
+                    let _ = events.send(TurnMessage::Event(ChatEvent::Token { text: tail }));
+                    if acks.recv().is_err() {
+                        cancel.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
+
+            let stats = match outcome {
+                Ok(Outcome::Finished(stats)) | Ok(Outcome::Cancelled(stats)) => stats,
+                Err(error) => {
+                    let _ = events.send(TurnMessage::Event(ChatEvent::Error {
+                        message: error.0.clone(),
+                    }));
+                    break Ok(());
+                }
+            };
+
+            if self.cancel.load(Ordering::SeqCst) {
+                let message_id = if visible.is_empty() {
+                    None
+                } else {
+                    self.store_mut()
+                        .and_then(|store| {
+                            store
+                                .append(Role::Assistant, &visible, false)
+                                .map_err(|error| error.to_string())
+                        })
+                        .map(|message| message.id)
+                        .ok()
+                };
+                let _ = events.send(TurnMessage::Event(ChatEvent::Cancelled { message_id }));
+                break Ok(());
+            }
+
+            // No call, or a call in the closing round, ends the turn: the call
+            // is dropped but the tools section stays in the prompt.
+            let Some(raw_call) = call.filter(|_| calls < MAX_TOOL_CALLS_PER_TURN) else {
                 let saved = self.store_mut().and_then(|store| {
                     store
-                        .append(Role::Assistant, &reply, false)
+                        .append(Role::Assistant, &visible, false)
                         .map_err(|error| error.to_string())
                 });
                 match saved {
@@ -1029,37 +1123,56 @@ impl Worker {
                             message_id: message.id,
                             stats,
                         }));
-                        Ok(())
+                        break Ok(());
                     }
                     Err(error) => {
                         let _ = events.send(TurnMessage::Event(ChatEvent::Error {
                             message: error.clone(),
                         }));
-                        Err(error)
+                        break Err(error);
                     }
                 }
+            };
+
+            if !visible.is_empty() {
+                let saved = self.store_mut().and_then(|store| {
+                    store
+                        .append(Role::Assistant, &visible, false)
+                        .map_err(|error| error.to_string())
+                });
+                if let Err(error) = saved {
+                    let _ = events.send(TurnMessage::Event(ChatEvent::Error {
+                        message: error.clone(),
+                    }));
+                    break Err(error);
+                }
             }
-            Ok(Outcome::Cancelled(_)) => {
-                let message_id = if reply.is_empty() {
-                    None
-                } else {
-                    self.store_mut()
-                        .and_then(|store| {
-                            store
-                                .append(Role::Assistant, &reply, false)
-                                .map_err(|error| error.to_string())
-                        })
-                        .map(|message| message.id)
-                        .ok()
-                };
-                let _ = events.send(TurnMessage::Event(ChatEvent::Cancelled { message_id }));
-                Ok(())
+
+            calls += 1;
+            let (name, mut result, valid) = match validate_call(&raw_call, &tools) {
+                Ok(valid_call) => {
+                    let result = self.search_memory(&valid_call.arguments, &window_ids);
+                    (valid_call.name, result, true)
+                }
+                Err(error) => ("unknown".to_string(), error, false),
+            };
+            if valid {
+                let _ = events.send(TurnMessage::Event(ChatEvent::Tool { name: name.clone() }));
             }
-            Err(error) => {
+            if calls == MAX_TOOL_CALLS_PER_TURN {
+                result.push_str("\n\n");
+                result.push_str(ANSWER_NOW);
+            }
+            let appended = self.store_mut().and_then(|store| {
+                store
+                    .append_tool(&name, &raw_call, &result)
+                    .map_err(|error| error.to_string())
+            });
+            if let Err(error) = appended {
                 let _ = events.send(TurnMessage::Event(ChatEvent::Error {
-                    message: error.0.clone(),
+                    message: error.clone(),
                 }));
-                Ok(())
+                break Err(error);
             }
         };
 
@@ -1067,6 +1180,67 @@ impl Worker {
         // for the next one.
         self.set_status(ChatState::Ready, None);
         turn
+    }
+
+    /// Answers a `search_memory` call from the index.
+    ///
+    /// `window_ids` are the working-memory messages of this round; they are
+    /// left out so the tool only recalls what has already left the prompt.
+    fn search_memory(
+        &mut self,
+        arguments: &serde_json::Map<String, serde_json::Value>,
+        window_ids: &HashSet<i64>,
+    ) -> String {
+        const FAILED: &str = "Memory search failed. Answer without it.";
+
+        let limit = arguments
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(DEFAULT_RECALL_LIMIT);
+        let Some(query) = arguments.get("query").and_then(serde_json::Value::as_str) else {
+            return FAILED.to_string();
+        };
+
+        let Some(runtime) = self.memory_runtime.as_mut() else {
+            return NOTHING_INDEXED.to_string();
+        };
+        if runtime.index.is_empty() {
+            return NOTHING_INDEXED.to_string();
+        }
+
+        let text = format!("{}{}", runtime.markers.query, query);
+        let Ok(mut vectors) = runtime.engine.embed(&[text]) else {
+            return FAILED.to_string();
+        };
+        let Some(mut q) = vectors.pop() else {
+            return FAILED.to_string();
+        };
+        if !normalize(&mut q) {
+            return FAILED.to_string();
+        }
+        let hits = runtime
+            .index
+            .search(&q, limit, &|id| window_ids.contains(&id));
+        if hits.is_empty() {
+            return NO_MATCHES.to_string();
+        }
+
+        let Ok(store) = self.store_mut() else {
+            return FAILED.to_string();
+        };
+        let mut messages: Vec<ChatMessage> = Vec::new();
+        for hit in hits {
+            if let Ok(Some(message)) = store.message(hit.message_id) {
+                messages.push(message);
+            }
+            if let Ok(Some(previous)) = store.previous_message(hit.message_id) {
+                messages.push(previous);
+            }
+        }
+        messages.sort_by_key(|message| message.id);
+        messages.dedup_by_key(|message| message.id);
+        format_recall(&messages)
     }
 
     /// Loads the persisted prefix state on the first turn of a session, when
@@ -1087,7 +1261,7 @@ impl Worker {
         else {
             return;
         };
-        let prefix = prefix_messages(settings);
+        let prefix = prefix_messages(&self.prefix_text(settings));
         let Ok(key) = PrefixKey::new(&model_path, &identity, &prefix[0].text) else {
             return;
         };
@@ -1124,7 +1298,7 @@ impl Worker {
         else {
             return;
         };
-        let prefix = prefix_messages(settings);
+        let prefix = prefix_messages(&self.prefix_text(settings));
         let Ok(key) = PrefixKey::new(&model_path, &identity, &prefix[0].text) else {
             return;
         };
@@ -1148,11 +1322,11 @@ impl Worker {
     }
 }
 
-/// The fixed prompt prefix for `settings`: the system message alone.
-fn prefix_messages(settings: &TurnSettings) -> Vec<PromptMessage> {
+/// The fixed prompt prefix for `text`: the system message alone.
+fn prefix_messages(text: &str) -> Vec<PromptMessage> {
     vec![PromptMessage {
         role: PromptRole::System,
-        text: system_text(&settings.system_addition),
+        text: text.to_string(),
     }]
 }
 
@@ -1167,7 +1341,7 @@ mod tests {
     use super::*;
     use crate::chat::compaction::{KEEP_VERBATIM, SUMMARY_HEADING};
     use crate::chat::engine::FakeEngine;
-    use crate::chat::prompt::PromptMessage;
+    use crate::chat::prompt::{PromptMessage, PromptRole};
     use crate::memory::FakeEmbedder;
     use serde_json::json;
     use std::path::Path;
@@ -1777,6 +1951,14 @@ mod tests {
             json!({"type": "token", "text": "hi"})
         );
 
+        let tool = ChatEvent::Tool {
+            name: "search_memory".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&tool).expect("serialise"),
+            json!({"type": "tool", "name": "search_memory"})
+        );
+
         let compacting = ChatEvent::Compacting;
         assert_eq!(
             serde_json::to_value(&compacting).expect("serialise"),
@@ -2247,5 +2429,281 @@ mod tests {
 
         service.stop();
         assert_eq!(service.memory_status().state, MemoryState::Off);
+    }
+
+    /// Starts a service with a custom engine factory and a fake embedder.
+    fn spawn_memory_service(
+        dir: &tempfile::TempDir,
+        factory: EngineFactory,
+    ) -> (ChatService, Arc<Mutex<Vec<MemoryStatus>>>) {
+        let (memory_sink, statuses) = recording_memory_sink();
+        let service = ChatService::spawn(ChatServiceDeps {
+            db_path: db_path(dir),
+            prefix_cache_dir: prefix_dir(dir),
+            engine_factory: factory,
+            embedding_factory: Box::new(|_config| Ok(Box::new(FakeEmbedder::new()))),
+            status_sink: Box::new(|_| {}),
+            memory_sink,
+        });
+        (service, statuses)
+    }
+
+    /// A factory whose engine emits one round of pieces per generate call.
+    fn rounds_factory(
+        rounds: Vec<Vec<&str>>,
+        log: Arc<Mutex<Vec<Vec<PromptMessage>>>>,
+    ) -> EngineFactory {
+        let rounds: Vec<Vec<String>> = rounds
+            .into_iter()
+            .map(|round| round.into_iter().map(str::to_string).collect())
+            .collect();
+        Box::new(move |_config| {
+            Ok(Box::new(
+                FakeEngine::new(Vec::new(), 4096)
+                    .with_rounds(rounds.clone())
+                    .with_prompt_log(Arc::clone(&log)),
+            ))
+        })
+    }
+
+    /// The prompt log, cloned out of its lock.
+    fn prompts(log: &Arc<Mutex<Vec<Vec<PromptMessage>>>>) -> Vec<Vec<PromptMessage>> {
+        log.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    #[test]
+    fn search_memory_answers_from_old_messages() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = db_path(&dir);
+        {
+            let mut store = ChatStore::open(&path).expect("open store");
+            store
+                .append(Role::User, "hello there", false)
+                .expect("append old user");
+            let second = store
+                .append(Role::Assistant, "My cat is named Pixel", false)
+                .expect("append old assistant");
+            store
+                .append_summary("earlier chat", second.id)
+                .expect("append summary");
+        }
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory = rounds_factory(
+            vec![
+                vec![
+                    "Let me check. ",
+                    "<tool_call>{\"name\":\"search_memory\",\"arguments\":{\"query\":\"cat named\"}}</tool_call>",
+                ],
+                vec!["Your cat is Pixel."],
+            ],
+            Arc::clone(&log),
+        );
+        let (service, statuses) = spawn_memory_service(&dir, factory);
+        service
+            .start(Some(config(&dir)), Some(embedding_config(&dir)))
+            .expect("start");
+        wait_for_memory(&statuses, |status| {
+            status.state == MemoryState::Ready && status.indexed == 2 && status.total == 2
+        })
+        .expect("the old messages should be indexed");
+
+        let mut events = Vec::new();
+        service
+            .send(
+                "what is my cat called?",
+                &TurnSettings::default(),
+                &mut |event| events.push(event),
+            )
+            .expect("send");
+
+        assert_eq!(events.len(), 4, "{events:?}");
+        assert!(matches!(&events[0], ChatEvent::Token { text } if text == "Let me check. "));
+        assert!(matches!(&events[1], ChatEvent::Tool { name } if name == "search_memory"));
+        assert!(matches!(&events[2], ChatEvent::Token { text } if text == "Your cat is Pixel."));
+        assert!(matches!(&events[3], ChatEvent::Done { .. }));
+
+        let history = service.history(10).expect("history");
+        let turn = &history[history.len() - 4..];
+        assert_eq!(turn[0].role, Role::User);
+        assert_eq!(turn[1].role, Role::Assistant);
+        assert_eq!(turn[1].text.trim(), "Let me check.");
+        assert_eq!(turn[2].role, Role::Tool);
+        assert_eq!(turn[2].tool_name.as_deref(), Some("search_memory"));
+        assert!(turn[2].text.contains("Pixel"), "{}", turn[2].text);
+        assert_eq!(turn[3].role, Role::Assistant);
+        assert_eq!(turn[3].text, "Your cat is Pixel.");
+
+        let prompts = prompts(&log);
+        assert_eq!(prompts.len(), 2, "one generate per round");
+        assert!(prompts[1][0].text.contains("Tools:"));
+        assert!(prompts[1]
+            .iter()
+            .any(|message| message.role == PromptRole::Tool && message.text.contains("Pixel")));
+    }
+
+    #[test]
+    fn without_memory_there_is_no_tools_section() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory: EngineFactory = {
+            let log = Arc::clone(&log);
+            Box::new(move |_config| {
+                Ok(Box::new(
+                    FakeEngine::new(vec!["ok".to_string()], 4096).with_prompt_log(Arc::clone(&log)),
+                ))
+            })
+        };
+        let service = service(&dir, factory);
+        service.start(Some(config(&dir)), None).expect("start");
+        service
+            .send("hi", &TurnSettings::default(), &mut |_| {})
+            .expect("send");
+
+        let prompts = prompts(&log);
+        let prompt = prompts.last().expect("a logged prompt");
+        assert!(!prompt[0].text.contains("Tools:"));
+    }
+
+    #[test]
+    fn an_unknown_tool_is_rejected_and_the_turn_continues() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory = rounds_factory(
+            vec![
+                vec!["<tool_call>{\"name\":\"nope\"}</tool_call>"],
+                vec!["All done."],
+            ],
+            Arc::clone(&log),
+        );
+        let (service, _statuses) = spawn_memory_service(&dir, factory);
+        service
+            .start(Some(config(&dir)), Some(embedding_config(&dir)))
+            .expect("start");
+
+        let mut events = Vec::new();
+        service
+            .send("hi", &TurnSettings::default(), &mut |event| {
+                events.push(event)
+            })
+            .expect("send");
+
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, ChatEvent::Tool { .. })));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ChatEvent::Done { .. })));
+
+        let history = service.history(10).expect("history");
+        let tool = history
+            .iter()
+            .find(|message| message.role == Role::Tool)
+            .expect("a tool row");
+        assert!(tool.text.contains("Unknown tool"), "{}", tool.text);
+        assert_eq!(tool.tool_name.as_deref(), Some("unknown"));
+    }
+
+    #[test]
+    fn at_most_three_calls_per_turn() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let call =
+            "<tool_call>{\"name\":\"search_memory\",\"arguments\":{\"query\":\"cat\"}}</tool_call>";
+        let factory = rounds_factory(
+            vec![vec![call], vec![call], vec![call], vec![call]],
+            Arc::clone(&log),
+        );
+        let (service, _statuses) = spawn_memory_service(&dir, factory);
+        service
+            .start(Some(config(&dir)), Some(embedding_config(&dir)))
+            .expect("start");
+
+        let mut events = Vec::new();
+        service
+            .send("hi", &TurnSettings::default(), &mut |event| {
+                events.push(event)
+            })
+            .expect("send");
+
+        let history = service.history(20).expect("history");
+        let tools: Vec<&ChatMessage> = history
+            .iter()
+            .filter(|message| message.role == Role::Tool)
+            .collect();
+        assert_eq!(tools.len(), MAX_TOOL_CALLS_PER_TURN, "{tools:?}");
+        assert!(!tools[0].text.ends_with(ANSWER_NOW));
+        assert!(tools[2].text.ends_with(ANSWER_NOW));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ChatEvent::Done { .. })));
+    }
+
+    #[test]
+    fn cancelling_during_a_round_stores_no_tool_row() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory = rounds_factory(
+            vec![
+                vec![
+                    "Looking. ",
+                    "<tool_call>{\"name\":\"search_memory\",\"arguments\":{\"query\":\"cat\"}}</tool_call>",
+                ],
+                vec!["never"],
+            ],
+            Arc::clone(&log),
+        );
+        let (service, _statuses) = spawn_memory_service(&dir, factory);
+        service
+            .start(Some(config(&dir)), Some(embedding_config(&dir)))
+            .expect("start");
+
+        let mut events = Vec::new();
+        service
+            .send("hi", &TurnSettings::default(), &mut |event| {
+                if matches!(event, ChatEvent::Token { .. }) {
+                    service.cancel();
+                }
+                events.push(event);
+            })
+            .expect("send");
+
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ChatEvent::Cancelled { .. })));
+        let history = service.history(10).expect("history");
+        assert!(!history.iter().any(|message| message.role == Role::Tool));
+    }
+
+    #[test]
+    fn nothing_indexed_says_so() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory = rounds_factory(
+            vec![
+                vec!["<tool_call>{\"name\":\"search_memory\",\"arguments\":{\"query\":\"cat\"}}</tool_call>"],
+                vec!["No memory."],
+            ],
+            Arc::clone(&log),
+        );
+        let (service, statuses) = spawn_memory_service(&dir, factory);
+        service
+            .start(Some(config(&dir)), Some(embedding_config(&dir)))
+            .expect("start");
+        wait_for_memory(&statuses, |status| status.state == MemoryState::Ready)
+            .expect("memory should reach Ready");
+
+        service
+            .send("hi", &TurnSettings::default(), &mut |_| {})
+            .expect("send");
+
+        let history = service.history(10).expect("history");
+        let tool = history
+            .iter()
+            .find(|message| message.role == Role::Tool)
+            .expect("a tool row");
+        assert_eq!(tool.text, NOTHING_INDEXED);
     }
 }
