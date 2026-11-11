@@ -250,6 +250,11 @@ pub async fn get_history(app: AppHandle) -> Result<Vec<ChatMessage>, CommandErro
     .map_err(CommandError::new)
 }
 
+/// Whether a reply should be read aloud: only replies to voice turns, and only when the setting is on.
+fn should_speak(speak_replies: bool, from_voice: bool) -> bool {
+    speak_replies && from_voice
+}
+
 /// Runs one chat turn, streaming `ChatEvent`s through `on_event`.
 #[tauri::command]
 pub async fn send_message(
@@ -258,6 +263,7 @@ pub async fn send_message(
     from_voice: Option<bool>,
     on_event: Channel<ChatEvent>,
 ) -> Result<(), CommandError> {
+    let from_voice = from_voice.unwrap_or(false);
     let (settings, speak) = {
         let state = app.state::<AppState>();
         let settings = state.settings();
@@ -266,18 +272,16 @@ pub async fn send_message(
             compaction: settings.compaction.clone(),
             persist_prefix_cache: settings.persist_prefix_cache,
         };
-        (turn, settings.voice.speak_replies)
+        (turn, should_speak(settings.voice.speak_replies, from_voice))
     };
     let handle = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = handle.state::<AppState>();
         // A new turn cuts any speech left over from the last one.
         state.speaker.stop();
-        state.chat.send_from(
-            &text,
-            from_voice.unwrap_or(false),
-            &settings,
-            &mut |event| {
+        state
+            .chat
+            .send_from(&text, from_voice, &settings, &mut |event| {
                 if let ChatEvent::Token { text } = &event {
                     if speak {
                         state.speaker.push(text);
@@ -290,8 +294,7 @@ pub async fn send_message(
                     state.speaker.end_reply();
                 }
                 let _ = on_event.send(event);
-            },
-        )
+            })
     })
     .await
     .map_err(|_| CommandError::new(CHAT_TASK_FAILED))?
@@ -522,6 +525,14 @@ mod tests {
             .expect("an error serialises"),
             serde_json::json!({ "message": "x" })
         );
+    }
+
+    #[test]
+    fn only_voice_turns_are_spoken_when_the_setting_is_on() {
+        assert!(should_speak(true, true));
+        assert!(!should_speak(true, false));
+        assert!(!should_speak(false, true));
+        assert!(!should_speak(false, false));
     }
 
     #[test]

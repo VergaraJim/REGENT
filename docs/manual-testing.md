@@ -91,7 +91,7 @@ Run them from the repository root.
 REGENT_TEST_TEXT_MODEL=/path/to/text.gguf \
   cargo test -p regent-app --test llama_smoke -- --nocapture
 
-# Chat engine: reply, cache reuse and summarising. Two tests are #[ignore]d.
+# Chat engine: reply, cache reuse and summarising. Three tests are #[ignore]d.
 REGENT_TEST_MODEL=/path/to/text.gguf \
   cargo test -p regent-app --test llama_chat_smoke -- --ignored --nocapture
 
@@ -254,30 +254,38 @@ or quiet, so a cough does not create a "Thank you." message.
 
 ### Spoken replies
 
-**Do:** leave **Read replies aloud** on and ask a question that needs a few
+**Do:** leave **Read replies aloud** on and **speak** a question that needs a few
 sentences.
 
 **Expect:** the reply is spoken sentence by sentence as it streams, not only
 after it finishes.
 
-**Do:** watch the mic while Regent speaks.
+**Do:** type a question instead.
+
+**Expect:** the reply appears as text only; nothing is spoken, even with Read
+replies aloud on.
+
+**Do:** speak a question that needs a few sentences and watch the mic while
+Regent speaks.
 
 **Expect:** it shows the muted "Microphone paused while Regent speaks" state,
 then resumes about 400 ms after the audio ends; the level meter comes back.
 
-**Do:** while Regent is speaking, press **Stop speaking** (the crossed-speaker
-button that appears in the header only while speech is playing).
+**Do:** speak a question that needs a few sentences, then while Regent is
+speaking, press **Stop speaking** (the crossed-speaker button that appears in
+the header only while speech is playing).
 
 **Expect:** the audio cuts off immediately.
 
-**Do:** repeat with the composer's **Cancel** button, with **Stop**, and by
-sending a new message mid-speech.
+**Do:** speak a question that needs a few sentences and repeat with the
+composer's **Cancel** button, with **Stop**, and by sending a new message
+mid-speech.
 
 **Expect:** all three cut the speech at once.
 
 ### Settings
 
-**Do:** turn **Read replies aloud** off and ask a question.
+**Do:** turn **Read replies aloud** off and speak a question.
 
 **Expect:** nothing is spoken; the reply is text only.
 

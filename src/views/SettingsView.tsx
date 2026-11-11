@@ -213,6 +213,7 @@ export function SettingsView({
                     </Switch.Control>
                   </Switch.Content>
                 </Switch>
+                <p className="mt-1 text-xs text-muted">Only replies to what you say into the mic.</p>
               </div>
               <Separator />
               <div className="py-3">

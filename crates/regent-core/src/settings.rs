@@ -249,7 +249,7 @@ pub struct MemoryOverrides {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VoiceSettings {
-    /// Read replies aloud.
+    /// Read replies to voice messages aloud.
     pub speak_replies: bool,
     /// Mute the microphone while Regent speaks.
     pub pause_mic_while_speaking: bool,
