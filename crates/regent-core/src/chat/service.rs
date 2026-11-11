@@ -5,18 +5,26 @@
 //! shared atomic flag, so [`ChatService::cancel`] works while a reply is
 //! streaming. Every state change is reported through the status sink.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use serde::Serialize;
 
+use super::compaction::{
+    accept_summary, build_summary_prompt, plan_compaction, summarizer_budget,
+    working_memory_tokens, CompactionPlan, MAX_COMPACTION_PASSES,
+};
 use super::engine::{ChatEngine, ChatEngineError, EngineConfig, GenerationStats, Outcome};
 use super::message::{ChatMessage, Role};
-use super::prompt::build_prompt;
+use super::prefix_cache::{PrefixCache, PrefixKey};
+use super::prompt::{build_prompt, system_text, PromptMessage, PromptRole};
 use super::store::{ChatStore, HISTORY_READ_CAP};
+use crate::context::compaction_thresholds;
+use crate::settings::CompactionSettings;
 
 /// The message for a start request that names no model.
 const NO_MODEL: &str = "No text model chosen. Open Settings and pick one.";
@@ -48,6 +56,8 @@ pub enum ChatState {
     Ready,
     /// A reply is being generated.
     Generating,
+    /// Older turns are being folded into a summary.
+    Compacting,
     /// Loading or a turn failed; the message is in [`ChatStatus::error`].
     Error,
 }
@@ -71,6 +81,8 @@ pub enum ChatEvent {
         /// The piece of text.
         text: String,
     },
+    /// Older turns are being folded into a summary before the reply.
+    Compacting,
     /// The reply finished and was saved.
     Done {
         /// The saved assistant message.
@@ -88,6 +100,17 @@ pub enum ChatEvent {
         /// The plain-language error.
         message: String,
     },
+}
+
+/// The per-turn settings the worker builds a turn with.
+#[derive(Debug, Clone, Default)]
+pub struct TurnSettings {
+    /// Extra text appended to the built-in system prompt.
+    pub system_addition: String,
+    /// When and how far history is compacted.
+    pub compaction: CompactionSettings,
+    /// Whether the fixed prompt prefix is saved and reused between runs.
+    pub persist_prefix_cache: bool,
 }
 
 /// Builds an engine from a configuration; the Tauri layer supplies the real
@@ -110,7 +133,7 @@ enum Command {
     /// Run one turn.
     Send {
         text: String,
-        system_addition: String,
+        settings: TurnSettings,
         events: Sender<TurnMessage>,
         acks: Receiver<()>,
     },
@@ -136,6 +159,7 @@ pub struct ChatService {
     commands: Sender<Command>,
     status: Arc<Mutex<ChatStatus>>,
     cancel_flag: Arc<AtomicBool>,
+    idle_cancel: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -143,18 +167,26 @@ impl ChatService {
     /// Starts the worker thread.
     ///
     /// The worker owns the engine and opens the history store at `db_path` the
-    /// first time it needs it. Every state change is passed to `status_sink`.
-    pub fn spawn(db_path: PathBuf, factory: EngineFactory, status_sink: StatusSink) -> ChatService {
+    /// first time it needs it. Persisted prefix states are kept under
+    /// `prefix_cache_dir`. Every state change is passed to `status_sink`.
+    pub fn spawn(
+        db_path: PathBuf,
+        prefix_cache_dir: PathBuf,
+        factory: EngineFactory,
+        status_sink: StatusSink,
+    ) -> ChatService {
         let status = Arc::new(Mutex::new(ChatStatus {
             state: ChatState::Stopped,
             error: None,
         }));
         let cancel_flag = Arc::new(AtomicBool::new(false));
+        let idle_cancel = Arc::new(AtomicBool::new(false));
         let (commands, incoming) = mpsc::channel();
 
         let worker = {
             let status = Arc::clone(&status);
             let cancel_flag = Arc::clone(&cancel_flag);
+            let idle_cancel = Arc::clone(&idle_cancel);
             std::thread::spawn(move || {
                 Worker {
                     db_path,
@@ -162,8 +194,15 @@ impl ChatService {
                     status,
                     sink: status_sink,
                     cancel: cancel_flag,
+                    idle_cancel,
                     engine: None,
                     store: None,
+                    last_settings: None,
+                    pending: VecDeque::new(),
+                    prefix_cache: PrefixCache::new(prefix_cache_dir),
+                    started_config: None,
+                    prefix_load_tried: false,
+                    prefix_saved: false,
                 }
                 .run(incoming);
             })
@@ -173,6 +212,7 @@ impl ChatService {
             commands,
             status,
             cancel_flag,
+            idle_cancel,
             worker: Some(worker),
         }
     }
@@ -193,6 +233,8 @@ impl ChatService {
         self.commands
             .send(Command::Start { config, reply })
             .map_err(|_| WORKER_GONE.to_string())?;
+        // Any idle compaction the worker is running belongs to the past.
+        self.idle_cancel.store(true, Ordering::SeqCst);
         answer.recv().map_err(|_| WORKER_GONE.to_string())?
     }
 
@@ -206,20 +248,24 @@ impl ChatService {
     pub fn stop(&self) {
         self.cancel_flag.store(true, Ordering::SeqCst);
         let (reply, done) = mpsc::channel();
-        if self.commands.send(Command::Stop { reply }).is_ok() {
+        let sent = self.commands.send(Command::Stop { reply }).is_ok();
+        self.idle_cancel.store(true, Ordering::SeqCst);
+        if sent {
             let _ = done.recv();
         }
     }
 
     /// Runs one chat turn, handing every streamed event to `on_event`.
     ///
-    /// The whole prompt is rebuilt and generated on each turn; no cache is
-    /// reused. The call blocks until the reply finishes, is cancelled or
-    /// fails.
+    /// The prompt is rebuilt from the stored history on every turn, including
+    /// the rolling summary when one exists. When the prompt would grow past the
+    /// window's hard limit, a compaction pass runs first and is announced with
+    /// [`ChatEvent::Compacting`]. The call blocks until the reply finishes, is
+    /// cancelled or fails.
     pub fn send(
         &self,
         text: &str,
-        system_addition: &str,
+        settings: &TurnSettings,
         on_event: &mut dyn FnMut(ChatEvent),
     ) -> Result<(), String> {
         let (events, incoming) = mpsc::channel();
@@ -229,11 +275,13 @@ impl ChatService {
         self.commands
             .send(Command::Send {
                 text: text.to_string(),
-                system_addition: system_addition.to_string(),
+                settings: settings.clone(),
                 events,
                 acks,
             })
             .map_err(|_| WORKER_GONE.to_string())?;
+        // A new turn outranks any idle compaction the worker may be running.
+        self.idle_cancel.store(true, Ordering::SeqCst);
 
         loop {
             match incoming.recv() {
@@ -275,6 +323,7 @@ impl ChatService {
         self.commands
             .send(Command::History { limit, reply })
             .map_err(|_| WORKER_GONE.to_string())?;
+        self.idle_cancel.store(true, Ordering::SeqCst);
         answer.recv().map_err(|_| WORKER_GONE.to_string())?
     }
 }
@@ -282,6 +331,7 @@ impl ChatService {
 impl Drop for ChatService {
     fn drop(&mut self) {
         self.cancel_flag.store(true, Ordering::SeqCst);
+        self.idle_cancel.store(true, Ordering::SeqCst);
         let _ = self.commands.send(Command::Shutdown);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -296,14 +346,35 @@ struct Worker {
     status: Arc<Mutex<ChatStatus>>,
     sink: StatusSink,
     cancel: Arc<AtomicBool>,
+    idle_cancel: Arc<AtomicBool>,
     engine: Option<Box<dyn ChatEngine>>,
     store: Option<ChatStore>,
+    /// The settings of the most recent turn, reused by the idle pass.
+    last_settings: Option<TurnSettings>,
+    /// Commands picked up while an idle pass was starting.
+    pending: VecDeque<Command>,
+    /// Where persisted prefix states live.
+    prefix_cache: PrefixCache,
+    /// The configuration the engine was started with, kept for the prefix key.
+    started_config: Option<EngineConfig>,
+    /// Whether this session has tried to load the prefix cache.
+    prefix_load_tried: bool,
+    /// Whether this session already has the prefix state in the cache.
+    prefix_saved: bool,
 }
 
 impl Worker {
-    /// The worker loop: one command at a time, in arrival order.
+    /// The worker loop: queued commands first, then the channel, one at a time.
     fn run(mut self, commands: Receiver<Command>) {
-        for command in commands {
+        loop {
+            let command = match self.pending.pop_front() {
+                Some(command) => command,
+                None => match commands.recv() {
+                    Ok(command) => command,
+                    Err(_) => return,
+                },
+            };
+
             match command {
                 Command::Start { config, reply } => {
                     let _ = reply.send(self.start(&config));
@@ -315,12 +386,13 @@ impl Worker {
                 }
                 Command::Send {
                     text,
-                    system_addition,
+                    settings,
                     events,
                     acks,
                 } => {
-                    let result = self.send(&text, &system_addition, &events, &acks);
+                    let result = self.send(&text, &settings, &events, &acks);
                     let _ = events.send(TurnMessage::Finished(result));
+                    self.idle_compaction(&commands);
                 }
                 Command::History { limit, reply } => {
                     let _ = reply.send(self.history(limit));
@@ -375,6 +447,9 @@ impl Worker {
         match (self.factory)(config) {
             Ok(engine) => {
                 self.engine = Some(engine);
+                self.started_config = Some(config.clone());
+                self.prefix_load_tried = false;
+                self.prefix_saved = false;
                 self.set_status(ChatState::Ready, None);
                 Ok(())
             }
@@ -386,11 +461,125 @@ impl Worker {
         }
     }
 
+    /// The latest summary's text and the messages that summary doesn't cover.
+    fn working_memory(&mut self) -> Result<(Option<String>, Vec<ChatMessage>), String> {
+        let store = self.store_mut()?;
+        let latest = store.latest_summary().map_err(|error| error.to_string())?;
+        let after = latest.as_ref().map_or(0, |summary| summary.covers_through);
+        let messages = store
+            .messages_after(after, HISTORY_READ_CAP)
+            .map_err(|error| error.to_string())?;
+        Ok((latest.map(|summary| summary.text), messages))
+    }
+
+    /// Plans the next compaction pass for `threshold`, or `None` when the
+    /// working prompt is small enough or too little history exists.
+    fn next_plan(&mut self, settings: &TurnSettings, threshold: usize) -> Option<CompactionPlan> {
+        let system = system_text(&settings.system_addition);
+        let (summary, messages) = self.working_memory().ok()?;
+        let engine = self.engine.as_ref()?;
+        let context_tokens = engine.context_tokens();
+        let thresholds = compaction_thresholds(
+            u32::try_from(context_tokens).unwrap_or(u32::MAX),
+            &settings.compaction,
+        );
+        plan_compaction(
+            &system,
+            summary.as_deref(),
+            &messages,
+            threshold,
+            thresholds.target as usize,
+            summarizer_budget(context_tokens),
+            &|piece| engine.count_tokens(piece),
+        )
+    }
+
+    /// Folds old turns into summaries until the prompt is small enough.
+    ///
+    /// Returns whether at least one summary was stored. A failure, a rejected
+    /// reply or a cancellation stops the loop quietly: the prompt builder's
+    /// fallback trimming still keeps the turn under the window.
+    fn compact(&mut self, settings: &TurnSettings, threshold: usize, cancel: &AtomicBool) -> bool {
+        let mut stored = false;
+        for _ in 0..MAX_COMPACTION_PASSES {
+            let Some(plan) = self.next_plan(settings, threshold) else {
+                break;
+            };
+            let prompt = build_summary_prompt(plan.previous_summary.as_deref(), &plan.fold);
+            let summary = match self.engine.as_mut() {
+                Some(engine) => engine.summarize(&prompt, plan.cap_tokens, cancel),
+                None => break,
+            };
+            let Ok(Some(text)) = summary else {
+                break;
+            };
+            let accepted = match self.engine.as_ref() {
+                Some(engine) => {
+                    accept_summary(&text, plan.cap_tokens, &|piece| engine.count_tokens(piece))
+                }
+                None => break,
+            };
+            let Some(text) = accepted else {
+                break;
+            };
+            let appended = match self.store_mut() {
+                Ok(store) => store.append_summary(&text, plan.covers_through),
+                Err(_) => break,
+            };
+            match appended {
+                Ok(_) => stored = true,
+                Err(_) => break,
+            }
+            if cancel.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        stored
+    }
+
+    /// Runs one compaction pass in the idle window after a reply.
+    ///
+    /// Any command that arrives first is queued and cancels the pass, so a new
+    /// turn never waits on idle work.
+    fn idle_compaction(&mut self, commands: &Receiver<Command>) {
+        let Some(settings) = self.last_settings.clone() else {
+            return;
+        };
+        let Some(engine) = self.engine.as_ref() else {
+            return;
+        };
+        let context_tokens = engine.context_tokens();
+
+        self.idle_cancel.store(false, Ordering::SeqCst);
+        match commands.try_recv() {
+            Ok(command) => {
+                self.pending.push_back(command);
+                return;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => return,
+        }
+
+        let trigger = compaction_thresholds(
+            u32::try_from(context_tokens).unwrap_or(u32::MAX),
+            &settings.compaction,
+        )
+        .trigger as usize;
+        if self.next_plan(&settings, trigger).is_some() {
+            self.set_status(ChatState::Compacting, None);
+            let cancel = Arc::clone(&self.idle_cancel);
+            self.compact(&settings, trigger, &cancel);
+            self.set_status(ChatState::Ready, None);
+        }
+
+        self.save_prefix_cache(&settings);
+    }
+
     /// Runs one turn and streams its events to `events`.
     fn send(
         &mut self,
         text: &str,
-        system_addition: &str,
+        settings: &TurnSettings,
         events: &Sender<TurnMessage>,
         acks: &Receiver<()>,
     ) -> Result<(), String> {
@@ -401,32 +590,61 @@ impl Worker {
             return Ok(());
         }
 
+        self.last_settings = Some(settings.clone());
+
         // Each turn starts with a fresh cancel flag.
         self.cancel.store(false, Ordering::SeqCst);
 
-        {
-            let store = self.store_mut()?;
-            store
-                .append(Role::User, text, false)
-                .map_err(|error| error.to_string())?;
-        }
-        let history = self
-            .store_mut()?
-            .recent(HISTORY_READ_CAP)
+        self.store_mut()?
+            .append(Role::User, text, false)
             .map_err(|error| error.to_string())?;
 
-        let engine = match self.engine.as_ref() {
-            Some(engine) => engine,
+        self.set_status(ChatState::Generating, None);
+
+        let system = system_text(&settings.system_addition);
+        let context_tokens = match self.engine.as_ref() {
+            Some(engine) => engine.context_tokens(),
             None => return Err(NOT_STARTED.to_string()),
         };
+        let hard_limit = compaction_thresholds(
+            u32::try_from(context_tokens).unwrap_or(u32::MAX),
+            &settings.compaction,
+        )
+        .hard_limit as usize;
+
+        let (mut summary, mut messages) = self.working_memory()?;
+        let too_big = match self.engine.as_ref() {
+            Some(engine) => {
+                working_memory_tokens(&system, summary.as_deref(), &messages, &|piece| {
+                    engine.count_tokens(piece)
+                }) > hard_limit
+            }
+            None => return Err(NOT_STARTED.to_string()),
+        };
+        if too_big {
+            let _ = events.send(TurnMessage::Event(ChatEvent::Compacting));
+            let cancel = Arc::clone(&self.cancel);
+            self.compact(settings, hard_limit, &cancel);
+            let (next_summary, next_messages) = self.working_memory()?;
+            summary = next_summary;
+            messages = next_messages;
+        }
+
+        let Some(engine) = self.engine.as_ref() else {
+            return Err(NOT_STARTED.to_string());
+        };
         let prompt = build_prompt(
-            system_addition,
-            &history,
-            engine.context_tokens(),
+            &settings.system_addition,
+            summary.as_deref(),
+            &messages,
+            context_tokens,
             &|piece| engine.count_tokens(piece),
         );
 
-        self.set_status(ChatState::Generating, None);
+        if settings.persist_prefix_cache && !self.prefix_load_tried {
+            self.prefix_load_tried = true;
+            self.maybe_load_prefix(settings);
+        }
 
         let cancel = Arc::clone(&self.cancel);
         let mut reply = String::new();
@@ -498,12 +716,91 @@ impl Worker {
         turn
     }
 
+    /// Loads the persisted prefix state on the first turn of a session, when
+    /// the engine supports it. Failures are silent: the turn simply decodes
+    /// the prefix as usual.
+    fn maybe_load_prefix(&mut self, settings: &TurnSettings) {
+        let Some(identity) = self
+            .engine
+            .as_ref()
+            .and_then(|engine| engine.cache_identity())
+        else {
+            return;
+        };
+        let Some(model_path) = self
+            .started_config
+            .as_ref()
+            .map(|config| config.model_path.clone())
+        else {
+            return;
+        };
+        let prefix = prefix_messages(settings);
+        let Ok(key) = PrefixKey::new(&model_path, &identity, &prefix[0].text) else {
+            return;
+        };
+        let Some(path) = self.prefix_cache.lookup(&key) else {
+            return;
+        };
+        if let Some(engine) = self.engine.as_mut() {
+            if matches!(engine.load_prefix(&prefix, &path), Ok(true)) {
+                self.prefix_saved = true;
+            }
+        }
+    }
+
+    /// Saves the prefix state at most once per session, in the idle window
+    /// after a reply. Failures are silent and never change the chat state.
+    fn save_prefix_cache(&mut self, settings: &TurnSettings) {
+        if !settings.persist_prefix_cache
+            || self.prefix_saved
+            || self.idle_cancel.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        let Some(identity) = self
+            .engine
+            .as_ref()
+            .and_then(|engine| engine.cache_identity())
+        else {
+            return;
+        };
+        let Some(model_path) = self
+            .started_config
+            .as_ref()
+            .map(|config| config.model_path.clone())
+        else {
+            return;
+        };
+        let prefix = prefix_messages(settings);
+        let Ok(key) = PrefixKey::new(&model_path, &identity, &prefix[0].text) else {
+            return;
+        };
+        self.prefix_saved = true;
+        if self.prefix_cache.lookup(&key).is_some() {
+            return;
+        }
+        let Some(engine) = self.engine.as_mut() else {
+            return;
+        };
+        let _ = self.prefix_cache.store(&key, &mut |path| {
+            engine.save_prefix(&prefix, path).map_err(|error| error.0)
+        });
+    }
+
     /// Reads stored history, opening the store if needed.
     fn history(&mut self, limit: usize) -> Result<Vec<ChatMessage>, String> {
         self.store_mut()?
             .recent(limit)
             .map_err(|error| error.to_string())
     }
+}
+
+/// The fixed prompt prefix for `settings`: the system message alone.
+fn prefix_messages(settings: &TurnSettings) -> Vec<PromptMessage> {
+    vec![PromptMessage {
+        role: PromptRole::System,
+        text: system_text(&settings.system_addition),
+    }]
 }
 
 /// The history database path for a test directory.
@@ -515,8 +812,16 @@ fn db_path(dir: &tempfile::TempDir) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat::compaction::{KEEP_VERBATIM, SUMMARY_HEADING};
     use crate::chat::engine::FakeEngine;
+    use crate::chat::prompt::PromptMessage;
     use serde_json::json;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    /// The window size the compaction tests use: trigger 288, target 0 (summary
+    /// cap 32) and hard limit 488 with the default settings.
+    const CONTEXT_TOKENS: usize = 1000;
 
     /// A factory that returns a [`FakeEngine`] emitting `pieces`.
     fn piece_factory(pieces: &[&str]) -> EngineFactory {
@@ -528,6 +833,14 @@ mod tests {
     fn failing_factory(message: &str) -> EngineFactory {
         let message = message.to_string();
         Box::new(move |_config| Ok(Box::new(FakeEngine::failing(message.clone()))))
+    }
+
+    /// `count` distinct words: the fake engine counts one token per word.
+    fn words(count: usize, label: &str) -> String {
+        (0..count)
+            .map(|index| format!("{label}{index}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// A status sink that records every change.
@@ -556,15 +869,74 @@ mod tests {
         }
     }
 
+    fn prefix_dir(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("kv")
+    }
+
     fn service(dir: &tempfile::TempDir, factory: EngineFactory) -> ChatService {
-        ChatService::spawn(db_path(dir), factory, Box::new(|_| {}))
+        ChatService::spawn(db_path(dir), prefix_dir(dir), factory, Box::new(|_| {}))
+    }
+
+    fn states(statuses: &Arc<Mutex<Vec<ChatStatus>>>) -> Vec<ChatState> {
+        statuses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|status| status.state)
+            .collect()
+    }
+
+    /// Whether a `Compacting` state is followed by a `Ready` one.
+    fn compaction_finished(statuses: &Arc<Mutex<Vec<ChatStatus>>>) -> bool {
+        let mut compacting = false;
+        for state in states(statuses) {
+            match state {
+                ChatState::Compacting => compacting = true,
+                ChatState::Ready if compacting => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Waits up to 5 s for the idle pass, without sending a command (which
+    /// would cancel it).
+    fn wait_for_compaction(statuses: &Arc<Mutex<Vec<ChatStatus>>>) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if compaction_finished(statuses) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        compaction_finished(statuses)
+    }
+
+    /// Seeds `count` messages of `width` words each, directly through the store.
+    fn seed(path: &Path, count: usize, width: usize) {
+        let mut store = ChatStore::open(path).expect("open store");
+        for index in 0..count {
+            let role = if index % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            };
+            store
+                .append(role, &words(width, &format!("seed{index}_")), false)
+                .expect("append seed message");
+        }
     }
 
     #[test]
     fn start_then_send_streams_tokens_and_saves_both_messages() {
         let dir = tempfile::tempdir().expect("temp dir");
         let (sink, statuses) = recording_sink();
-        let service = ChatService::spawn(db_path(&dir), piece_factory(&["Hello", " there"]), sink);
+        let service = ChatService::spawn(
+            db_path(&dir),
+            prefix_dir(&dir),
+            piece_factory(&["Hello", " there"]),
+            sink,
+        );
 
         service
             .start(Some(config(&dir)))
@@ -573,7 +945,9 @@ mod tests {
 
         let mut events = Vec::new();
         service
-            .send("hi", "", &mut |event| events.push(event))
+            .send("hi", &TurnSettings::default(), &mut |event| {
+                events.push(event)
+            })
             .expect("send should succeed");
 
         let tokens: Vec<&str> = events
@@ -593,6 +967,8 @@ mod tests {
             })
             .expect("a Done event");
         assert_eq!(done.1.generated_tokens, 2);
+        assert_eq!(done.1.reused_tokens, 0);
+        assert_eq!(done.1.processed_tokens, done.1.prompt_tokens);
 
         let history = service.history(10).expect("history");
         assert_eq!(
@@ -607,14 +983,8 @@ mod tests {
         assert_eq!(history[1].id, done.0);
 
         assert_eq!(service.status().state, ChatState::Ready);
-        let seen: Vec<ChatState> = statuses
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .map(|status| status.state)
-            .collect();
         assert_eq!(
-            seen,
+            states(&statuses),
             vec![
                 ChatState::Loading,
                 ChatState::Ready,
@@ -632,7 +1002,7 @@ mod tests {
 
         let mut events = Vec::new();
         service
-            .send("hi", "", &mut |event| {
+            .send("hi", &TurnSettings::default(), &mut |event| {
                 if matches!(event, ChatEvent::Token { .. }) {
                     service.cancel();
                 }
@@ -666,7 +1036,7 @@ mod tests {
         let service = service(&dir, piece_factory(&["never"]));
 
         let error = service
-            .send("hi", "", &mut |_| {})
+            .send("hi", &TurnSettings::default(), &mut |_| {})
             .expect_err("send should fail");
         assert_eq!(error, "Start Regent first.");
         assert!(service.history(10).expect("history").is_empty());
@@ -715,7 +1085,9 @@ mod tests {
         {
             let service = service(&dir, piece_factory(&["remembered"]));
             service.start(Some(config(&dir))).expect("start");
-            service.send("hi", "", &mut |_| {}).expect("send");
+            service
+                .send("hi", &TurnSettings::default(), &mut |_| {})
+                .expect("send");
         }
 
         let reopened = service(&dir, piece_factory(&["again"]));
@@ -737,7 +1109,9 @@ mod tests {
 
         let mut events = Vec::new();
         service
-            .send("hi", "", &mut |event| events.push(event))
+            .send("hi", &TurnSettings::default(), &mut |event| {
+                events.push(event)
+            })
             .expect("send should succeed");
 
         let message = events
@@ -764,7 +1138,7 @@ mod tests {
 
         let mut count = 0;
         service
-            .send("   ", "", &mut |_| count += 1)
+            .send("   ", &TurnSettings::default(), &mut |_| count += 1)
             .expect("send should succeed");
         assert_eq!(count, 0);
         assert!(service.history(10).expect("history").is_empty());
@@ -783,6 +1157,158 @@ mod tests {
     }
 
     #[test]
+    fn idle_compaction_stores_a_summary_after_a_reply() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let stored_summary = "they talked about the weather";
+        let reply = words(30, "reply");
+        let factory: EngineFactory = {
+            let reply = reply.clone();
+            Box::new(move |_config| {
+                Ok(Box::new(
+                    FakeEngine::new(vec![reply.clone()], CONTEXT_TOKENS)
+                        .with_summaries(vec![stored_summary.to_string()]),
+                ))
+            })
+        };
+        let (sink, statuses) = recording_sink();
+        let service = ChatService::spawn(db_path(&dir), prefix_dir(&dir), factory, sink);
+        service.start(Some(config(&dir))).expect("start");
+
+        // The system message costs 34 words + 4 template tokens, so after four
+        // 30-word turns (8 messages) the prompt passes the 288-token trigger.
+        let mut compacted = false;
+        for turn in 0..6 {
+            let text = words(30, &format!("turn{turn}_"));
+            service
+                .send(&text, &TurnSettings::default(), &mut |_| {})
+                .expect("send");
+            if turn >= 3 && wait_for_compaction(&statuses) {
+                compacted = true;
+                break;
+            }
+        }
+        assert!(compacted, "idle compaction should run after a reply");
+
+        let seen = states(&statuses);
+        let compacting_at = seen
+            .iter()
+            .position(|state| *state == ChatState::Compacting)
+            .expect("a Compacting status");
+        assert!(
+            seen[compacting_at + 1..].contains(&ChatState::Ready),
+            "Compacting should be followed by Ready: {seen:?}"
+        );
+
+        let store = ChatStore::open(&db_path(&dir)).expect("open a second store");
+        let summary = store
+            .latest_summary()
+            .expect("read summary")
+            .expect("a stored summary");
+        assert_eq!(summary.text, stored_summary);
+
+        let history = store.recent(10).expect("history");
+        assert!(history.len() > KEEP_VERBATIM);
+        assert_eq!(
+            summary.covers_through,
+            history[history.len() - KEEP_VERBATIM - 1].id,
+            "the newest {KEEP_VERBATIM} messages stay out of the summary"
+        );
+    }
+
+    #[test]
+    fn an_oversized_prompt_compacts_before_generating() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = db_path(&dir);
+        seed(&path, 14, 40);
+        let first_seed = words(40, "seed0_");
+        let folded_summary = "the user and regent discussed seeded topics";
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory: EngineFactory = {
+            let log = Arc::clone(&log);
+            Box::new(move |_config| {
+                Ok(Box::new(
+                    FakeEngine::new(vec!["ok".to_string()], CONTEXT_TOKENS)
+                        .with_summaries(vec![folded_summary.to_string(); 4])
+                        .with_prompt_log(Arc::clone(&log)),
+                ))
+            })
+        };
+        let service = ChatService::spawn(path.clone(), prefix_dir(&dir), factory, Box::new(|_| {}));
+        service.start(Some(config(&dir))).expect("start");
+
+        let mut events = Vec::new();
+        service
+            .send(
+                &words(40, "newest_"),
+                &TurnSettings::default(),
+                &mut |event| events.push(event),
+            )
+            .expect("send");
+
+        let compacting_at = events
+            .iter()
+            .position(|event| matches!(event, ChatEvent::Compacting))
+            .expect("a Compacting event");
+        let first_token = events
+            .iter()
+            .position(|event| matches!(event, ChatEvent::Token { .. }))
+            .expect("a Token event");
+        assert!(
+            compacting_at < first_token,
+            "Compacting must come before the reply: {events:?}"
+        );
+
+        let prompts = log
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let generate: &Vec<PromptMessage> = prompts.last().expect("a logged prompt");
+        assert!(generate[0].text.contains(SUMMARY_HEADING));
+        assert!(generate[0].text.contains(folded_summary));
+        assert!(
+            generate
+                .iter()
+                .all(|message| !message.text.contains(&first_seed)),
+            "the folded messages are left out of the prompt"
+        );
+
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ChatEvent::Done { .. })));
+    }
+
+    #[test]
+    fn a_failed_summary_still_answers() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = db_path(&dir);
+        seed(&path, 14, 40);
+        let service = service(&dir, {
+            let pieces = vec!["ok".to_string()];
+            Box::new(move |_config| Ok(Box::new(FakeEngine::new(pieces.clone(), CONTEXT_TOKENS))))
+        });
+        service.start(Some(config(&dir))).expect("start");
+
+        let mut events = Vec::new();
+        service
+            .send(
+                &words(40, "newest_"),
+                &TurnSettings::default(),
+                &mut |event| events.push(event),
+            )
+            .expect("send should succeed even without a summary");
+
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ChatEvent::Done { .. })));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ChatEvent::Compacting)));
+
+        let store = ChatStore::open(&path).expect("open a second store");
+        assert_eq!(store.latest_summary().expect("read summary"), None);
+    }
+
+    #[test]
     fn chat_event_json_shapes_are_stable() {
         let token = ChatEvent::Token {
             text: "hi".to_string(),
@@ -792,10 +1318,18 @@ mod tests {
             json!({"type": "token", "text": "hi"})
         );
 
+        let compacting = ChatEvent::Compacting;
+        assert_eq!(
+            serde_json::to_value(&compacting).expect("serialise"),
+            json!({"type": "compacting"})
+        );
+
         let done = ChatEvent::Done {
             message_id: 7,
             stats: GenerationStats {
                 prompt_tokens: 3,
+                reused_tokens: 1,
+                processed_tokens: 2,
                 generated_tokens: 2,
                 tokens_per_second: 1.5,
             },
@@ -807,6 +1341,8 @@ mod tests {
                 "message_id": 7,
                 "stats": {
                     "prompt_tokens": 3,
+                    "reused_tokens": 1,
+                    "processed_tokens": 2,
                     "generated_tokens": 2,
                     "tokens_per_second": 1.5
                 }
@@ -853,6 +1389,7 @@ mod tests {
             (ChatState::Loading, "loading"),
             (ChatState::Ready, "ready"),
             (ChatState::Generating, "generating"),
+            (ChatState::Compacting, "compacting"),
             (ChatState::Error, "error"),
         ] {
             assert_eq!(
@@ -881,7 +1418,7 @@ mod tests {
             })
         };
         let (sink, statuses) = recording_sink();
-        let service = ChatService::spawn(db_path(&dir), factory, sink);
+        let service = ChatService::spawn(db_path(&dir), prefix_dir(&dir), factory, sink);
 
         let config = config(&dir);
         assert_eq!(
@@ -897,14 +1434,8 @@ mod tests {
         service.start(Some(config)).expect("retry should work");
         assert_eq!(service.status().state, ChatState::Ready);
 
-        let seen: Vec<ChatState> = statuses
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .map(|status| status.state)
-            .collect();
         assert_eq!(
-            seen,
+            states(&statuses),
             vec![
                 ChatState::Loading,
                 ChatState::Error,
@@ -912,5 +1443,145 @@ mod tests {
                 ChatState::Ready
             ]
         );
+    }
+
+    /// Settings with prefix persistence on.
+    fn prefix_settings() -> TurnSettings {
+        TurnSettings {
+            persist_prefix_cache: true,
+            ..TurnSettings::default()
+        }
+    }
+
+    /// A factory whose engine has a prefix cache logging into `log`.
+    fn prefix_factory(log: &Arc<Mutex<Vec<String>>>) -> EngineFactory {
+        let log = Arc::clone(log);
+        Box::new(move |_config| {
+            Ok(Box::new(
+                FakeEngine::new(vec!["ok".to_string()], 4096).with_prefix_cache(Arc::clone(&log)),
+            ))
+        })
+    }
+
+    fn log_entries(log: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        log.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Waits up to 5 s for the idle pass to log `needle`.
+    fn wait_for_log(log: &Arc<Mutex<Vec<String>>>, needle: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if log_entries(log).iter().any(|entry| entry == needle) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        log_entries(log).iter().any(|entry| entry == needle)
+    }
+
+    fn state_files(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("state"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn wait_for_state_files(dir: &Path) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if !state_files(dir).is_empty() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        !state_files(dir).is_empty()
+    }
+
+    #[test]
+    fn a_prefix_cache_is_saved_then_loaded_by_a_new_session() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let kv = prefix_dir(&dir);
+        let config = config(&dir);
+
+        let first_log = Arc::new(Mutex::new(Vec::new()));
+        {
+            let service = ChatService::spawn(
+                db_path(&dir),
+                kv.clone(),
+                prefix_factory(&first_log),
+                Box::new(|_| {}),
+            );
+            service.start(Some(config.clone())).expect("start");
+            service
+                .send("hi", &prefix_settings(), &mut |_| {})
+                .expect("send");
+
+            assert!(
+                wait_for_log(&first_log, "save"),
+                "the first session should save its prefix: {:?}",
+                log_entries(&first_log)
+            );
+            assert!(
+                wait_for_state_files(&kv),
+                "a persisted state file should exist"
+            );
+        }
+
+        let second_log = Arc::new(Mutex::new(Vec::new()));
+        let service = ChatService::spawn(
+            db_path(&dir),
+            kv.clone(),
+            prefix_factory(&second_log),
+            Box::new(|_| {}),
+        );
+        service.start(Some(config)).expect("start");
+
+        let mut at_first_token = None;
+        service
+            .send("again", &prefix_settings(), &mut |event| {
+                if at_first_token.is_none() && matches!(event, ChatEvent::Token { .. }) {
+                    at_first_token = Some(log_entries(&second_log));
+                }
+            })
+            .expect("send");
+
+        let at_first_token = at_first_token.expect("a Token event");
+        assert!(
+            at_first_token.iter().any(|entry| entry == "load:true"),
+            "the prefix should load before the reply: {at_first_token:?}"
+        );
+    }
+
+    #[test]
+    fn the_prefix_cache_stays_empty_when_persistence_is_off() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let kv = prefix_dir(&dir);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let service = ChatService::spawn(
+            db_path(&dir),
+            kv.clone(),
+            prefix_factory(&log),
+            Box::new(|_| {}),
+        );
+        service.start(Some(config(&dir))).expect("start");
+
+        service
+            .send("hi", &TurnSettings::default(), &mut |_| {})
+            .expect("send");
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert!(
+            log_entries(&log).is_empty(),
+            "no prefix work should run: {:?}",
+            log_entries(&log)
+        );
+        assert!(state_files(&kv).is_empty());
     }
 }

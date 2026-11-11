@@ -12,7 +12,9 @@ function controller(
     messages: [],
     chatState,
     error: null,
+    turnError: null,
     streamingText: null,
+    compactingReply: false,
     start: () => {},
     stop: () => {},
     send: () => {},
@@ -80,11 +82,57 @@ describe("ChatView markup", () => {
     expect(html).toContain('aria-label="Send"');
   });
 
+  it("shows a turn error without a Start button", () => {
+    const html = render(
+      controller("ready", {
+        messages,
+        turnError: "The model ran out of memory.",
+      }),
+    );
+    expect(html).toContain("The model ran out of memory.");
+    expect(html).not.toContain("Start");
+  });
+
+  it("tells the user how to continue when stopped with a conversation", () => {
+    const html = render(controller("stopped", { messages }));
+    expect(html).toContain("Regent is stopped. Press Start to continue.");
+    expect(html).toContain("Hello there");
+  });
+
   it("turns Send into Cancel while generating", () => {
     const html = render(
       controller("generating", { messages, streamingText: "Partial" }),
     );
     expect(html).toContain('aria-label="Cancel"');
     expect(html).toContain("Partial");
+  });
+
+  it("shows idle compaction and keeps the composer enabled", () => {
+    const html = render(controller("compacting", { messages }));
+    expect(html).toContain('role="status"');
+    expect(html).toContain("Compacting…");
+    expect(html).toContain('aria-label="Send"');
+
+    const textarea = /<textarea[^>]*aria-label="Message"[^>]*>/.exec(html)?.[0];
+    expect(textarea).toBeTruthy();
+    expect(textarea).not.toContain("disabled");
+  });
+
+  it("shows compaction inside the reply bubble before the first token", () => {
+    const html = render(
+      controller("ready", {
+        messages,
+        streamingText: "",
+        compactingReply: true,
+      }),
+    );
+    expect(html.match(/Compacting…/g)).toHaveLength(1);
+
+    const log = html.indexOf('role="log"');
+    const hint = html.indexOf("Compacting…");
+    const composer = html.indexOf('aria-label="Message"');
+    expect(log).toBeGreaterThanOrEqual(0);
+    expect(hint).toBeGreaterThan(log);
+    expect(hint).toBeLessThan(composer);
   });
 });

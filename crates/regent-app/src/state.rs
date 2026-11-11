@@ -69,6 +69,7 @@ impl AppState {
         );
         let chat = ChatService::spawn(
             paths.database_file.clone(),
+            paths.prefix_cache_dir.clone(),
             engine_factory(),
             Box::new(move |status| {
                 let _ = app.emit(CHAT_STATE, status);

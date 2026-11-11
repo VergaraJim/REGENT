@@ -8,6 +8,8 @@ export interface MessageBubbleProps {
   fromVoice?: boolean;
   /** Shows the blinking caret after the text while a reply streams in. */
   streaming?: boolean;
+  /** Muted text shown instead of the caret while `text` is still empty. */
+  placeholder?: string;
 }
 
 /** One turn in the conversation: user on the right, assistant on the left. */
@@ -16,6 +18,7 @@ export function MessageBubble({
   text,
   fromVoice = false,
   streaming = false,
+  placeholder,
 }: MessageBubbleProps) {
   const isUser = role === "user";
 
@@ -36,13 +39,19 @@ export function MessageBubble({
             className="mr-1 inline-block align-text-bottom"
           />
         ) : null}
-        {text}
-        {streaming ? (
-          <span
-            aria-hidden="true"
-            className="ml-0.5 inline-block h-4 w-0.5 animate-caret-blink bg-current align-text-bottom"
-          />
-        ) : null}
+        {text.length > 0 || !placeholder ? (
+          <>
+            {text}
+            {streaming ? (
+              <span
+                aria-hidden="true"
+                className="ml-0.5 inline-block h-4 w-0.5 animate-caret-blink bg-current align-text-bottom"
+              />
+            ) : null}
+          </>
+        ) : (
+          <span className="text-muted">{placeholder}</span>
+        )}
       </div>
     </div>
   );
