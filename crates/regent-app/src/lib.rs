@@ -53,6 +53,7 @@ pub fn run() {
             commands::cancel_generation,
             commands::get_chat_state,
             commands::get_memory_status,
+            commands::get_vision_status,
             commands::get_history,
             commands::set_listening,
             commands::get_voice_status,

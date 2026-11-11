@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
 use regent_core::chat::{
     ChatEvent, ChatMessage, ChatStatus, EngineConfig, TurnSettings, HISTORY_READ_CAP,
@@ -12,6 +13,7 @@ use regent_core::chat::{
 use regent_core::estimate::SlotId;
 use regent_core::memory::{EmbeddingConfig, MemoryStatus};
 use regent_core::settings::{SaveError, Settings, SettingsStore};
+use regent_core::vision::{VisionConfig, VisionStatus};
 use regent_core::voice::{SttConfig, VoiceStatus};
 use serde::Serialize;
 use tauri::ipc::Channel;
@@ -186,11 +188,14 @@ pub async fn start_chat(app: AppHandle) -> Result<(), CommandError> {
     let settings = app.state::<AppState>().settings();
     let config = engine_config(&settings);
     let embedding = embedding_config(&settings);
+    let vision = vision_config(&settings);
     let stt = stt_config(&settings);
     let voice = settings.models.tts.voice_path.clone();
     let handle = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = handle.state::<AppState>();
+        // Configure vision before the chat starts, so its tool list sees it.
+        state.vision.configure(vision);
         state
             .chat
             .start(config, embedding)
@@ -213,6 +218,8 @@ pub async fn stop_chat(app: AppHandle) -> Result<(), CommandError> {
         state.speaker.set_voice(None);
         state.voice.stop();
         state.chat.stop();
+        // Turn vision off too: this unloads the model and reports `off`.
+        state.vision.configure(None);
     })
     .await
     .map_err(|_| CommandError::new(CHAT_TASK_FAILED))
@@ -236,6 +243,12 @@ pub async fn get_chat_state(app: AppHandle) -> ChatStatus {
 #[tauri::command]
 pub async fn get_memory_status(app: AppHandle) -> MemoryStatus {
     app.state::<AppState>().chat.memory_status()
+}
+
+/// The vision service's current state.
+#[tauri::command]
+pub async fn get_vision_status(app: AppHandle) -> VisionStatus {
+    app.state::<AppState>().vision.status()
 }
 
 /// The newest stored chat messages, oldest first.
@@ -344,6 +357,21 @@ fn embedding_config(settings: &Settings) -> Option<EmbeddingConfig> {
         context_size: slot.context_size,
         document_prefix: slot.document_prefix.clone(),
         query_prefix: slot.query_prefix.clone(),
+    })
+}
+
+/// The vision configuration from the settings, or `None` unless both the model
+/// and its projector are chosen.
+fn vision_config(settings: &Settings) -> Option<VisionConfig> {
+    let slot = &settings.models.vision;
+    let model_path = slot.model_path.as_ref()?;
+    let projector_path = slot.projector_path.as_ref()?;
+    Some(VisionConfig {
+        model_path: model_path.clone(),
+        projector_path: projector_path.clone(),
+        gpu_layers: slot.gpu_layers,
+        max_image_edge: slot.max_image_edge,
+        keep_alive: Duration::from_secs(u64::from(slot.keep_alive_secs.max(1))),
     })
 }
 
@@ -498,6 +526,57 @@ mod tests {
         let config = stt_config(&settings).expect("a config when a path is set");
         assert_eq!(config.model_path, PathBuf::from("C:/models/ggml-base.bin"));
         assert_eq!(config.language, "fr");
+    }
+
+    #[test]
+    fn vision_config_is_none_without_paths() {
+        let settings = Settings::default();
+        assert!(vision_config(&settings).is_none());
+    }
+
+    #[test]
+    fn vision_config_is_none_with_only_the_model() {
+        let mut settings = Settings::default();
+        settings.models.vision.model_path = Some(PathBuf::from("C:/models/vision.gguf"));
+        assert!(vision_config(&settings).is_none());
+    }
+
+    #[test]
+    fn vision_config_is_none_with_only_the_projector() {
+        let mut settings = Settings::default();
+        settings.models.vision.projector_path = Some(PathBuf::from("C:/models/mmproj.gguf"));
+        assert!(vision_config(&settings).is_none());
+    }
+
+    #[test]
+    fn vision_config_copies_the_fields_with_both_paths() {
+        let mut settings = Settings::default();
+        settings.models.vision.model_path = Some(PathBuf::from("C:/models/vision.gguf"));
+        settings.models.vision.projector_path = Some(PathBuf::from("C:/models/mmproj.gguf"));
+        settings.models.vision.gpu_layers = 12;
+        settings.models.vision.max_image_edge = 800;
+        settings.models.vision.keep_alive_secs = 30;
+
+        let config = vision_config(&settings).expect("a config when both paths are set");
+        assert_eq!(config.model_path, PathBuf::from("C:/models/vision.gguf"));
+        assert_eq!(
+            config.projector_path,
+            PathBuf::from("C:/models/mmproj.gguf")
+        );
+        assert_eq!(config.gpu_layers, 12);
+        assert_eq!(config.max_image_edge, 800);
+        assert_eq!(config.keep_alive, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn vision_keep_alive_is_at_least_one_second() {
+        let mut settings = Settings::default();
+        settings.models.vision.model_path = Some(PathBuf::from("C:/models/vision.gguf"));
+        settings.models.vision.projector_path = Some(PathBuf::from("C:/models/mmproj.gguf"));
+        settings.models.vision.keep_alive_secs = 0;
+
+        let config = vision_config(&settings).expect("a config when both paths are set");
+        assert_eq!(config.keep_alive, Duration::from_secs(1));
     }
 
     #[test]
