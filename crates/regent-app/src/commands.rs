@@ -6,9 +6,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
+use regent_core::chat::{ChatEvent, ChatMessage, ChatStatus, EngineConfig, HISTORY_READ_CAP};
 use regent_core::estimate::SlotId;
 use regent_core::settings::{SaveError, Settings, SettingsStore};
 use serde::Serialize;
+use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::DialogExt;
 
@@ -19,6 +21,9 @@ const MAIN_WINDOW: &str = "main";
 
 /// The warning shown when a Piper voice has no sidecar config beside it.
 const VOICE_CONFIG_WARNING: &str = "This voice needs its .onnx.json file in the same folder.";
+
+/// The error when a background chat task cannot be awaited.
+const CHAT_TASK_FAILED: &str = "Regent's chat service stopped unexpectedly. Restart Regent.";
 
 #[derive(Serialize)]
 pub struct AppInfo {
@@ -166,6 +171,89 @@ pub async fn request_estimate(app: AppHandle, settings: Option<Settings>) -> u64
         None => state.settings(),
     };
     state.estimator.request(settings)
+}
+
+/// Loads the text model configured in Settings.
+///
+/// Errors are already written for the person using Regent; the frontend only
+/// has to show them.
+#[tauri::command]
+pub async fn start_chat(app: AppHandle) -> Result<(), CommandError> {
+    let config = {
+        let state = app.state::<AppState>();
+        engine_config(&state.settings())
+    };
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || handle.state::<AppState>().chat.start(config))
+        .await
+        .map_err(|_| CommandError::new(CHAT_TASK_FAILED))?
+        .map_err(CommandError::new)
+}
+
+/// Drops the text model and stops any reply that is streaming.
+#[tauri::command]
+pub async fn stop_chat(app: AppHandle) -> Result<(), CommandError> {
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || handle.state::<AppState>().chat.stop())
+        .await
+        .map_err(|_| CommandError::new(CHAT_TASK_FAILED))
+}
+
+/// Stops the reply that is currently streaming, if any.
+#[tauri::command]
+pub async fn cancel_generation(app: AppHandle) {
+    app.state::<AppState>().chat.cancel();
+}
+
+/// The chat service's current state.
+#[tauri::command]
+pub async fn get_chat_state(app: AppHandle) -> ChatStatus {
+    app.state::<AppState>().chat.status()
+}
+
+/// The newest stored chat messages, oldest first.
+#[tauri::command]
+pub async fn get_history(app: AppHandle) -> Result<Vec<ChatMessage>, CommandError> {
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        handle.state::<AppState>().chat.history(HISTORY_READ_CAP)
+    })
+    .await
+    .map_err(|_| CommandError::new(CHAT_TASK_FAILED))?
+    .map_err(CommandError::new)
+}
+
+/// Runs one chat turn, streaming `ChatEvent`s through `on_event`.
+#[tauri::command]
+pub async fn send_message(
+    app: AppHandle,
+    text: String,
+    on_event: Channel<ChatEvent>,
+) -> Result<(), CommandError> {
+    let system_addition = app.state::<AppState>().settings().system_prompt_addition;
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        handle
+            .state::<AppState>()
+            .chat
+            .send(&text, &system_addition, &mut |event| {
+                let _ = on_event.send(event);
+            })
+    })
+    .await
+    .map_err(|_| CommandError::new(CHAT_TASK_FAILED))?
+    .map_err(CommandError::new)
+}
+
+/// The text model configuration from the settings, or `None` when no model is
+/// chosen.
+fn engine_config(settings: &Settings) -> Option<EngineConfig> {
+    let slot = &settings.models.text;
+    slot.path.as_ref().map(|path| EngineConfig {
+        model_path: path.clone(),
+        gpu_layers: slot.gpu_layers,
+        context_size: slot.context_size,
+    })
 }
 
 /// Locks the store, ignoring a poisoned lock: the data is still usable.

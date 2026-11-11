@@ -7,7 +7,7 @@
  * types below mirror that JSON exactly. Optional fields are left out of the
  * JSON when they are `null` on the Rust side.
  */
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
@@ -225,6 +225,51 @@ export interface EstimateReady {
 export const ESTIMATE_READY_EVENT = "estimate-ready";
 
 /* ------------------------------------------------------------------ */
+/* Chat                                                                */
+/* ------------------------------------------------------------------ */
+
+export type ChatRole = "user" | "assistant";
+
+/** Where the chat engine is in its lifecycle. */
+export type ChatState =
+  | "stopped"
+  | "loading"
+  | "ready"
+  | "generating"
+  | "error";
+
+/** One stored turn in the conversation. */
+export interface ChatMessage {
+  id: number;
+  role: ChatRole;
+  text: string;
+  from_voice: boolean;
+  created_at: number;
+}
+
+/** The payload of the `chat-state` event and of `get_chat_state`. */
+export interface ChatStateEvent {
+  state: ChatState;
+  error: string | null;
+}
+
+export interface GenerationStats {
+  prompt_tokens: number;
+  generated_tokens: number;
+  tokens_per_second: number;
+}
+
+/** One event streamed back over the `send_message` channel. */
+export type ChatEvent =
+  | { type: "token"; text: string }
+  | { type: "done"; message_id: number; stats: GenerationStats }
+  | { type: "cancelled"; message_id: number | null }
+  | { type: "error"; message: string };
+
+/** The event the backend emits whenever the chat engine changes state. */
+export const CHAT_STATE_EVENT = "chat-state";
+
+/* ------------------------------------------------------------------ */
 /* Commands                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -267,6 +312,57 @@ export function onEstimate(
   cb: (ready: EstimateReady) => void,
 ): Promise<UnlistenFn> {
   return listen<EstimateReady>(ESTIMATE_READY_EVENT, (event) => {
+    cb(event.payload);
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* Chat commands                                                       */
+/* ------------------------------------------------------------------ */
+
+/** Loads the text model from the settings and gets the engine ready. */
+export function startChat(): Promise<void> {
+  return invoke<void>("start_chat");
+}
+
+/** Unloads the engine and clears the in-memory model. */
+export function stopChat(): Promise<void> {
+  return invoke<void>("stop_chat");
+}
+
+/** Stops the current reply, saving whatever text was already produced. */
+export function cancelGeneration(): Promise<void> {
+  return invoke<void>("cancel_generation");
+}
+
+/** Reads the engine's current state. */
+export function getChatState(): Promise<ChatStateEvent> {
+  return invoke<ChatStateEvent>("get_chat_state");
+}
+
+/** Reads the stored conversation, oldest first. */
+export function getHistory(): Promise<ChatMessage[]> {
+  return invoke<ChatMessage[]>("get_history");
+}
+
+/**
+ * Sends `text` and calls `onEvent` for every streamed token and for the final
+ * `done`, `cancelled` or `error` event. Resolves when the turn ends.
+ */
+export function sendMessage(
+  text: string,
+  onEvent: (event: ChatEvent) => void,
+): Promise<void> {
+  const channel = new Channel<ChatEvent>();
+  channel.onmessage = onEvent;
+  return invoke<void>("send_message", { text, onEvent: channel });
+}
+
+/** Calls `cb` for every engine state change. Remember to call the unlistener. */
+export function onChatState(
+  cb: (event: ChatStateEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<ChatStateEvent>(CHAT_STATE_EVENT, (event) => {
     cb(event.payload);
   });
 }

@@ -6,6 +6,10 @@
 
 #[cfg(feature = "llama")]
 pub mod llama;
+#[cfg(feature = "llama")]
+pub mod llama_chat;
 
 #[cfg(feature = "llama")]
 pub use llama::{smoke_generate, EngineError, SmokeOutput};
+#[cfg(feature = "llama")]
+pub use llama_chat::LlamaChatEngine;

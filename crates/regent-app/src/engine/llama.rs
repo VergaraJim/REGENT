@@ -73,7 +73,7 @@ pub struct SmokeOutput {
 /// Calling `llama_backend_init` twice makes llama.cpp abort its own global
 /// state: always go through this function, never call `LlamaBackend::init`
 /// directly more than once.
-fn backend() -> Result<&'static LlamaBackend, EngineError> {
+pub(crate) fn backend() -> Result<&'static LlamaBackend, EngineError> {
     static BACKEND: OnceLock<Result<LlamaBackend, String>> = OnceLock::new();
 
     let init = BACKEND
