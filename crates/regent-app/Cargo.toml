@@ -13,8 +13,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [features]
-default = ["llama"]
+default = ["llama", "audio"]
 llama = ["dep:llama-cpp-2"]
+audio = ["dep:cpal"]
 
 [dev-dependencies]
 tempfile = "3"
@@ -27,3 +28,4 @@ serde_json = "1"
 regent-core = { path = "../regent-core" }
 thiserror = "2"
 llama-cpp-2 = { version = "0.1.161", optional = true, default-features = false }
+cpal = { version = "0.16", optional = true }

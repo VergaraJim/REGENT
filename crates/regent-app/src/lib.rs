@@ -1,6 +1,7 @@
 mod commands;
 mod state;
 
+pub mod audio;
 pub mod engine;
 pub mod tts;
 
