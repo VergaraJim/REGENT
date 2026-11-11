@@ -296,6 +296,18 @@ export interface MemoryStatus {
 /** The event the backend emits whenever the memory index changes state. */
 export const MEMORY_STATUS_EVENT = "memory-status";
 
+/** Where the vision engine is in its lifecycle. */
+export type VisionState = "off" | "idle" | "loading" | "ready";
+
+/** The payload of the `vision-status` event and of `get_vision_status`. */
+export interface VisionStatus {
+  state: VisionState;
+  error: string | null;
+}
+
+/** The event the backend emits whenever the vision engine changes state. */
+export const VISION_STATUS_EVENT = "vision-status";
+
 /* ------------------------------------------------------------------ */
 /* Voice                                                               */
 /* ------------------------------------------------------------------ */
@@ -460,6 +472,20 @@ export function onMemoryStatus(
   cb: (event: MemoryStatus) => void,
 ): Promise<UnlistenFn> {
   return listen<MemoryStatus>(MEMORY_STATUS_EVENT, (event) => {
+    cb(event.payload);
+  });
+}
+
+/** Reads the vision engine's current state. */
+export function getVisionStatus(): Promise<VisionStatus> {
+  return invoke<VisionStatus>("get_vision_status");
+}
+
+/** Calls `cb` for every vision state change. Remember to call the unlistener. */
+export function onVisionStatus(
+  cb: (event: VisionStatus) => void,
+): Promise<UnlistenFn> {
+  return listen<VisionStatus>(VISION_STATUS_EVENT, (event) => {
     cb(event.payload);
   });
 }

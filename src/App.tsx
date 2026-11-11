@@ -5,6 +5,7 @@ import { SettingsView } from "./views/SettingsView.tsx";
 import { useChat } from "./hooks/useChat.ts";
 import { useMemoryStatus } from "./hooks/useMemoryStatus.ts";
 import { useSettings } from "./hooks/useSettings.ts";
+import { useVisionStatus } from "./hooks/useVisionStatus.ts";
 import { useVoice } from "./hooks/useVoice.ts";
 import { useAppliedTheme } from "./theme.ts";
 
@@ -16,6 +17,7 @@ export default function App() {
   const chat = useChat();
   const voice = useVoice(chat);
   const memory = useMemoryStatus();
+  const vision = useVisionStatus();
   // Treat "settings not loaded yet" as set so the hint does not flash on startup.
   const textModelSet =
     settings.view === null ||
@@ -40,6 +42,7 @@ export default function App() {
             textModelSet={textModelSet}
             onOpenSettings={() => setView("settings")}
             memory={memory}
+            vision={vision}
             voiceNotice={voice.status?.error ?? voice.outputError}
           />
         </>

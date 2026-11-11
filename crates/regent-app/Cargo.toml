@@ -13,9 +13,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [features]
-default = ["llama", "audio"]
-llama = ["dep:llama-cpp-2"]
+default = ["llama", "audio", "screen"]
+llama = ["dep:llama-cpp-2", "llama-cpp-2/mtmd"]
 audio = ["dep:cpal"]
+screen = ["dep:xcap"]
 
 [dev-dependencies]
 tempfile = "3"
@@ -29,3 +30,4 @@ regent-core = { path = "../regent-core" }
 thiserror = "2"
 llama-cpp-2 = { version = "0.1.161", optional = true, default-features = false }
 cpal = { version = "0.16", optional = true }
+xcap = { version = "0.9.10", optional = true }

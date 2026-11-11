@@ -10,6 +10,8 @@ pub mod llama;
 pub mod llama_chat;
 #[cfg(feature = "llama")]
 pub mod llama_embed;
+#[cfg(feature = "llama")]
+pub mod llama_vision;
 
 #[cfg(feature = "llama")]
 pub use llama::{smoke_generate, EngineError, SmokeOutput};
@@ -17,3 +19,5 @@ pub use llama::{smoke_generate, EngineError, SmokeOutput};
 pub use llama_chat::LlamaChatEngine;
 #[cfg(feature = "llama")]
 pub use llama_embed::LlamaEmbeddingEngine;
+#[cfg(feature = "llama")]
+pub use llama_vision::{vision_factory, LlamaVisionEngine};

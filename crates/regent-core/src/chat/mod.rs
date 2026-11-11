@@ -11,6 +11,7 @@ pub mod prefix_cache;
 pub mod prompt;
 pub mod service;
 pub mod store;
+pub mod think;
 pub mod tools;
 
 pub use compaction::{
@@ -31,8 +32,9 @@ pub use service::{
     TurnSettings,
 };
 pub use store::{ChatStore, ChatStoreError, Summary, HISTORY_READ_CAP};
+pub use think::{strip_think, ThinkFilter, THINK_CLOSE, THINK_OPEN};
 pub use tools::{
-    search_memory_spec, tools_section, validate_call, ParamKind, ParamSpec, ParsedPiece,
-    ToolCallParser, ToolSpec, ValidCall, ANSWER_NOW, MAX_TOOL_CALLS_PER_TURN, TOOL_CALL_CLOSE,
-    TOOL_CALL_OPEN, TOOL_RESULT_HEADING,
+    look_at_screen_spec, search_memory_spec, tools_section, validate_call, ParamKind, ParamSpec,
+    ParsedPiece, ToolCallParser, ToolSpec, ValidCall, ANSWER_NOW, MAX_TOOL_CALLS_PER_TURN,
+    TOOL_CALL_CLOSE, TOOL_CALL_OPEN, TOOL_RESULT_HEADING,
 };

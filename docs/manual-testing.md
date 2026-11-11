@@ -1,9 +1,9 @@
-# Manual testing: compaction, memory and voice
+# Manual testing: compaction, memory, voice and vision
 
 This guide checks the parts that automated tests cannot: real models, a real
-microphone, real speakers and a real restart. Every check is a **Do** line
-followed by an **Expect** line. Do them in order; later stages assume the
-earlier ones passed.
+microphone, real speakers, a real screen and a real restart. Every check is a
+**Do** line followed by an **Expect** line. Do them in order; later stages assume
+the earlier ones passed.
 
 Code, not this page, is the source of truth. If a label or message differs, the
 app is right and this page is stale.
@@ -77,6 +77,7 @@ overrides the location; release builds ignore it.
 | Memory | a GGUF embedding model, such as `nomic-embed-text` or `bge-small` |
 | Voice in | a Whisper ggml model, for example `ggml-base.en.bin` |
 | Voice out | a Piper voice, `<name>.onnx` **plus** its `<name>.onnx.json` in the same folder |
+| Vision | a vision GGUF **plus** its matching projector (mmproj) file |
 
 Regent ships no model weights; each model has its own licence.
 
@@ -106,6 +107,11 @@ REGENT_TEST_STT_MODEL=/path/to/ggml-base.en.bin \
 # Piper synthesis. Needs the fetched engine; --no-default-features skips llama.cpp.
 REGENT_TEST_PIPER_VOICE=/path/to/en_US-lessac-low.onnx \
   cargo test -p regent-app --no-default-features --test piper_smoke -- --nocapture
+
+# Vision engine: reads a solid red test image. #[ignore]d; needs both files.
+REGENT_TEST_VISION_MODEL=/path/to/vision.gguf \
+  REGENT_TEST_VISION_PROJECTOR=/path/to/mmproj.gguf \
+  cargo test -p regent-app --test llama_vision_smoke -- --ignored --nocapture
 ```
 
 `REGENT_TEST_PIPER_DIR` overrides the Piper folder for the last test; it
@@ -351,6 +357,128 @@ speech model has been loaded at least once.
 input needs a speech model. Open Settings." Clicking it opens Settings. Typed
 chat still works normally.
 
+## Stage 7: Vision and non-thinking mode
+
+### Setup
+
+**Do:** in **Settings → Models → Vision model** press **Choose…** twice: pick a
+vision GGUF under **Model** and its matching projector (mmproj) under
+**Projector**. For example Gemma 3 4B, or Qwen2.5-VL 3B with its own mmproj;
+the projector must belong to the model. Go back, press **Stop**, then **Start**.
+
+**Expect:** no error line appears under the composer. Under **Options** the
+slot offers **Max image size** (default 1024 px) and **Unload after** (default
+120 seconds). The tool is only offered to the text model when **both** files are
+set.
+
+### Look at the screen
+
+**Do:** open something recognisable (a browser page, an editor with code), then
+ask "What's on my screen right now?".
+
+**Expect:** the first time, the line "Loading vision model…" with a spinner
+appears briefly above the memory line. The answer describes what is actually on
+the screen, and the reply carries the **Looked at screen** chip. Restart Regent,
+open the conversation again: it is still one bubble with the same chip.
+
+### Keep-alive
+
+**Do:** ask a second screen question within two minutes of the first.
+
+**Expect:** the answer comes back faster and there is no "Loading vision
+model…" line: the model is still loaded. (Compare wall-clock time; the UI does
+not print token counts.)
+
+**Do:** wait past **Unload after** (two minutes by default) and watch Regent's
+memory in the system monitor.
+
+**Expect:** the vision model unloads and RAM drops, without the app closing.
+The next screen question loads it again, so "Loading vision model…" reappears.
+
+**Do:** with the model loaded, press **Stop**.
+
+**Expect:** the model unloads at once and RAM drops.
+
+### Only when configured
+
+**Do:** remove the projector with its **Remove** (X) button, press **Stop** and
+**Start**, and ask "What's on my screen right now?".
+
+**Expect:** no "Looked at screen" chip: with one of the two files missing, the tool
+is not offered to the text model at all, so Regent answers that it can't see the
+screen instead of describing it. Typed chat still works.
+
+### Permission paths
+
+**Do:** on Wayland, deny the screen-sharing prompt from the desktop.
+
+**Expect:** the answer says it couldn't look at the screen, a red one-line error
+appears above the memory line reading "Regent couldn't capture the screen. Allow
+screen sharing when your desktop asks, then try again.", and hovering it shows
+the full text. Allow the prompt on the next question and it works again.
+
+**Do:** on macOS, deny the Screen Recording permission and ask about the screen.
+
+**Expect:** the same red line reads "Regent needs Screen Recording permission.
+Turn it on in System Settings → Privacy & Security → Screen Recording, then
+restart Regent." After turning it on and restarting Regent, screen questions work.
+
+### Privacy check
+
+**Do:** create a marker file:
+
+```sh
+# Linux
+touch /tmp/regent-vision-marker
+```
+
+```powershell
+# Windows PowerShell
+New-Item $env:TEMP\regent-vision-marker
+```
+
+**Do:** ask Regent to look at the screen a few times, then:
+
+```sh
+# Linux
+find ~/.local/share/regent ~/.cache/regent "${TMPDIR:-/tmp}" \
+  -newer /tmp/regent-vision-marker \
+  \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.webp' \
+  -o -iname '*.bmp' \)
+```
+
+```powershell
+# Windows PowerShell
+Get-ChildItem "$env:LOCALAPPDATA\regent", $env:TEMP -Recurse -Include *.png,*.jpg,*.jpeg,*.webp,*.bmp `
+  | Where-Object { $_.LastWriteTime -gt (Get-Item $env:TEMP\regent-vision-marker).LastWriteTime }
+```
+
+**Expect:** no image files are listed. The database, the logs and the prefix
+cache may have changed, but Regent never writes a screenshot to disk.
+
+### Non-thinking mode
+
+**Do:** with a Qwen3 text model chosen, ask a question that needs a short answer.
+
+**Expect:** the reply starts immediately with the answer: no reasoning text
+appears in the chat before it. Ask the same question with the mic and the reply is
+spoken from the answer onwards, with no reasoning read aloud.
+
+**Do:** check that no reasoning reached the database:
+
+```sh
+sqlite3 ~/.local/share/regent/regent.db \
+  "SELECT COUNT(*) FROM messages WHERE text LIKE '%<think>%';"
+```
+
+```powershell
+sqlite3 "$env:LOCALAPPDATA\regent\regent.db" "SELECT COUNT(*) FROM messages WHERE text LIKE '%<think>%';"
+```
+
+**Expect:** `0`. The reasoning filter also runs before tool calls, speech and
+summaries, so a model that still prints `<think>` cannot leak it into the
+conversation or the store.
+
 ## Troubleshooting
 
 **`npm run tauri dev` crashes in GTK/WebKit on Linux.** Try forcing X11:
@@ -369,6 +497,11 @@ microphone was found…", "Regent isn't allowed to use the microphone…", "The
 microphone couldn't be opened…" or "No speakers or headphones were found."
 Check the OS privacy settings and whether another app holds the device, then
 toggle the mic again.
+
+**Vision answers are wrong or the screenshot is empty.** Only the primary monitor
+is captured, and Regent's own window can appear in it. Lower **Max image size** in
+**Settings → Models → Vision model → Options** if the model complains that the
+screenshot is too large, and check that the projector belongs to the model.
 
 **Piper is missing.** Run `npm run fetch:piper` (it also runs before
 `npm run tauri dev` and `npm run tauri build`). It downloads the pinned release

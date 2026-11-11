@@ -6,7 +6,7 @@
 //! threads too, and report everything they do through events.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[cfg(not(feature = "llama"))]
 use regent_core::chat::ChatEngineError;
@@ -16,6 +16,7 @@ use regent_core::hardware::SystemProbe;
 use regent_core::memory::EmbeddingFactory;
 use regent_core::paths::AppPaths;
 use regent_core::settings::{Settings, SettingsStore};
+use regent_core::vision::{VisionDeps, VisionFactory, VisionService};
 use regent_core::voice::{
     Speaker, SpeakerDeps, SpeakerEvent, VoiceEvent, VoiceInput, VoiceInputDeps,
 };
@@ -34,6 +35,9 @@ pub const CHAT_STATE: &str = "chat-state";
 
 /// The event emitted whenever the memory indexer changes state.
 pub const MEMORY_STATUS: &str = "memory-status";
+
+/// The event emitted whenever the vision service changes state.
+pub const VISION_STATUS: &str = "vision-status";
 
 /// The event emitted whenever voice input changes state.
 pub const VOICE_STATUS: &str = "voice-status";
@@ -57,6 +61,10 @@ const NO_ENGINE: &str = "This build of Regent has no text engine.";
 /// The placeholder memory-engine error for a build without the llama feature.
 #[cfg(not(feature = "llama"))]
 const NO_MEMORY_ENGINE: &str = "This build of Regent has no memory engine.";
+
+/// The placeholder vision-engine error for a build without the llama feature.
+#[cfg(not(feature = "llama"))]
+const NO_VISION_ENGINE: &str = "This build of Regent has no vision engine.";
 
 /// The payload of [`ESTIMATE_READY`].
 #[derive(Debug, Clone, Serialize)]
@@ -104,6 +112,8 @@ pub struct AppState {
     pub estimator: Estimator,
     /// The worker that owns the text model and the chat history.
     pub chat: ChatService,
+    /// The worker that owns the vision model and looks at the screen.
+    pub vision: Arc<VisionService>,
     /// The always-listening voice input service.
     pub voice: VoiceInput,
     /// The service that speaks replies aloud.
@@ -137,6 +147,15 @@ impl AppState {
                 let _ = estimate_app.emit(ESTIMATE_READY, payload);
             }),
         );
+        let vision_app = app.clone();
+        let vision = Arc::new(VisionService::spawn(VisionDeps {
+            factory: vision_factory(),
+            capture: crate::screen::screen_capture(),
+            sink: Box::new(move |status| {
+                let _ = vision_app.emit(VISION_STATUS, status);
+            }),
+        }));
+
         let chat_app = app.clone();
         let memory_app = app.clone();
         let chat = ChatService::spawn(ChatServiceDeps {
@@ -150,6 +169,7 @@ impl AppState {
             memory_sink: Box::new(move |status| {
                 let _ = memory_app.emit(MEMORY_STATUS, status);
             }),
+            vision: Some(Arc::clone(&vision)),
         });
 
         let resource_dir = app.path().resource_dir().ok();
@@ -201,6 +221,7 @@ impl AppState {
             store: Mutex::new(store),
             estimator,
             chat,
+            vision,
             voice,
             speaker,
             resource_dir,
@@ -245,5 +266,17 @@ fn embedding_factory() -> EmbeddingFactory {
     #[cfg(not(feature = "llama"))]
     {
         Box::new(|_config| Err(ChatEngineError(NO_MEMORY_ENGINE.to_string())))
+    }
+}
+
+/// Builds the vision factory for this build.
+fn vision_factory() -> VisionFactory {
+    #[cfg(feature = "llama")]
+    {
+        crate::engine::vision_factory()
+    }
+    #[cfg(not(feature = "llama"))]
+    {
+        Box::new(|_config| Err(NO_VISION_ENGINE.to_string()))
     }
 }

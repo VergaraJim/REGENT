@@ -23,9 +23,10 @@ use super::message::{ChatMessage, Role};
 use super::prefix_cache::{PrefixCache, PrefixKey};
 use super::prompt::{build_prompt, fixed_prefix, PromptMessage, PromptRole};
 use super::store::{ChatStore, HISTORY_READ_CAP};
+use super::think::{strip_think, ThinkFilter};
 use super::tools::{
-    search_memory_spec, tools_section, validate_call, ToolCallParser, ToolSpec, ANSWER_NOW,
-    MAX_TOOL_CALLS_PER_TURN,
+    look_at_screen_spec, search_memory_spec, tools_section, validate_call, ToolCallParser,
+    ToolSpec, ANSWER_NOW, MAX_TOOL_CALLS_PER_TURN,
 };
 use crate::context::compaction_thresholds;
 use crate::memory::engine::{EmbeddingConfig, EmbeddingEngine, EmbeddingFactory};
@@ -36,6 +37,7 @@ use crate::memory::{
     INDEX_BATCH, MAX_INDEX_FAILURES, NOTHING_INDEXED, NO_MATCHES,
 };
 use crate::settings::CompactionSettings;
+use crate::vision::{VisionService, VISION_NOT_SET_UP};
 
 /// The message for a start request that names no model.
 const NO_MODEL: &str = "No text model chosen. Open Settings and pick one.";
@@ -162,6 +164,8 @@ pub struct ChatServiceDeps {
     pub status_sink: StatusSink,
     /// Receives every memory status change.
     pub memory_sink: MemorySink,
+    /// The vision service, when the app has one.
+    pub vision: Option<Arc<VisionService>>,
 }
 
 /// One request for the worker thread.
@@ -242,6 +246,7 @@ impl ChatService {
                 embedding_factory,
                 status_sink,
                 memory_sink,
+                vision,
             } = deps;
             std::thread::spawn(move || {
                 Worker {
@@ -252,6 +257,7 @@ impl ChatService {
                     memory,
                     sink: status_sink,
                     memory_sink,
+                    vision,
                     cancel: cancel_flag,
                     idle_cancel,
                     engine: None,
@@ -455,6 +461,8 @@ struct Worker {
     memory: Arc<Mutex<MemoryStatus>>,
     sink: StatusSink,
     memory_sink: MemorySink,
+    /// The vision service, when the app has one.
+    vision: Option<Arc<VisionService>>,
     cancel: Arc<AtomicBool>,
     idle_cancel: Arc<AtomicBool>,
     engine: Option<Box<dyn ChatEngine>>,
@@ -779,6 +787,8 @@ impl Worker {
             let Ok(Some(text)) = summary else {
                 break;
             };
+            // A hybrid model may wrap its summary in reasoning: never store it.
+            let text = strip_think(&text);
             let accepted = match self.engine.as_ref() {
                 Some(engine) => {
                     accept_summary(&text, plan.cap_tokens, &|piece| engine.count_tokens(piece))
@@ -954,13 +964,22 @@ impl Worker {
     }
 
     /// The tools available this turn: `search_memory` while a memory runtime
-    /// is loaded, whatever its state, and none otherwise.
+    /// is loaded, whatever its state, and `look_at_screen` while a vision
+    /// service is configured. The list only depends on what was set up when
+    /// the session started, so the prompt prefix stays constant.
     fn tools(&self) -> Vec<ToolSpec> {
+        let mut tools = Vec::new();
         if self.memory_runtime.is_some() {
-            vec![search_memory_spec()]
-        } else {
-            Vec::new()
+            tools.push(search_memory_spec());
         }
+        if self
+            .vision
+            .as_ref()
+            .is_some_and(|vision| vision.is_configured())
+        {
+            tools.push(look_at_screen_spec());
+        }
+        tools
     }
 
     /// The fixed prompt prefix for `settings`: the system prompt plus the tools
@@ -1060,19 +1079,49 @@ impl Worker {
             let round_stop = AtomicBool::new(false);
             let cancel = Arc::clone(&self.cancel);
             let mut parser = ToolCallParser::new();
+            let mut think = ThinkFilter::new();
             let mut visible = String::new();
             let mut call: Option<String> = None;
             let outcome = match self.engine.as_mut() {
                 Some(engine) => engine.generate(&prompt, &round_stop, &mut |piece| {
-                    let parsed = parser.push(piece);
+                    // Reasoning text is dropped before the tool-call parser sees
+                    // it, so a call inside it never runs.
+                    let shown = think.push(piece);
+                    if !shown.is_empty() {
+                        let parsed = parser.push(&shown);
+                        if !parsed.visible.is_empty() {
+                            visible.push_str(&parsed.visible);
+                            let _ = events.send(TurnMessage::Event(ChatEvent::Token {
+                                text: parsed.visible,
+                            }));
+                            // Wait for the caller to hand the piece to
+                            // `on_event`, which may cancel the turn, before
+                            // producing the next one.
+                            if acks.recv().is_err() {
+                                cancel.store(true, Ordering::SeqCst);
+                            }
+                        }
+                        if let Some(found) = parsed.call {
+                            call = Some(found);
+                            round_stop.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    if cancel.load(Ordering::SeqCst) {
+                        round_stop.store(true, Ordering::SeqCst);
+                    }
+                }),
+                None => return Err(NOT_STARTED.to_string()),
+            };
+
+            if call.is_none() {
+                let tail = think.finish();
+                if !tail.is_empty() {
+                    let parsed = parser.push(&tail);
                     if !parsed.visible.is_empty() {
                         visible.push_str(&parsed.visible);
                         let _ = events.send(TurnMessage::Event(ChatEvent::Token {
                             text: parsed.visible,
                         }));
-                        // Wait for the caller to hand the piece to `on_event`,
-                        // which may cancel the turn, before producing the next
-                        // one.
                         if acks.recv().is_err() {
                             cancel.store(true, Ordering::SeqCst);
                         }
@@ -1081,12 +1130,8 @@ impl Worker {
                         call = Some(found);
                         round_stop.store(true, Ordering::SeqCst);
                     }
-                    if cancel.load(Ordering::SeqCst) {
-                        round_stop.store(true, Ordering::SeqCst);
-                    }
-                }),
-                None => return Err(NOT_STARTED.to_string()),
-            };
+                }
+            }
 
             if call.is_none() {
                 let tail = parser.finish();
@@ -1168,7 +1213,13 @@ impl Worker {
             calls += 1;
             let (name, mut result, valid) = match validate_call(&raw_call, &tools) {
                 Ok(valid_call) => {
-                    let result = self.search_memory(&valid_call.arguments, &window_ids);
+                    let result = match valid_call.name.as_str() {
+                        "search_memory" => self.search_memory(&valid_call.arguments, &window_ids),
+                        "look_at_screen" => self.look_at_screen(&valid_call.arguments),
+                        // Validation only accepts names from `tools`, so this
+                        // cannot happen; it stays as a defensive fallback.
+                        _ => "Unknown tool.".to_string(),
+                    };
                     (valid_call.name, result, true)
                 }
                 Err(error) => ("unknown".to_string(), error, false),
@@ -1258,6 +1309,27 @@ impl Worker {
         messages.sort_by_key(|message| message.id);
         messages.dedup_by_key(|message| message.id);
         format_recall(&messages)
+    }
+
+    /// Answers a `look_at_screen` call through the vision service.
+    ///
+    /// Only the answer text reaches the chat model: the captured image is
+    /// dropped by the vision service as soon as it has been read.
+    fn look_at_screen(&self, arguments: &serde_json::Map<String, serde_json::Value>) -> String {
+        let Some(question) = arguments
+            .get("question")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return "Couldn't look at the screen: no question was given.".to_string();
+        };
+        let Some(vision) = self.vision.as_ref() else {
+            return format!("Couldn't look at the screen: {VISION_NOT_SET_UP}");
+        };
+
+        match vision.look(question, Arc::clone(&self.cancel)) {
+            Ok(answer) => format!("The screen (captured just now): {answer}"),
+            Err(message) => format!("Couldn't look at the screen: {message}"),
+        }
     }
 
     /// Loads the persisted prefix state on the first turn of a session, when
@@ -1359,7 +1431,11 @@ mod tests {
     use crate::chat::compaction::{KEEP_VERBATIM, SUMMARY_HEADING};
     use crate::chat::engine::FakeEngine;
     use crate::chat::prompt::{PromptMessage, PromptRole};
+    use crate::chat::think::{THINK_CLOSE, THINK_OPEN};
     use crate::memory::FakeEmbedder;
+    use crate::vision::{
+        fake_capture, FakeCaptureHandle, FakeVision, FakeVisionHandle, VisionConfig, VisionDeps,
+    };
     use serde_json::json;
     use std::path::Path;
     use std::time::{Duration, Instant};
@@ -1432,6 +1508,7 @@ mod tests {
             embedding_factory: Box::new(|_config| Ok(Box::new(FakeEmbedder::new()))),
             status_sink: sink,
             memory_sink: Box::new(|_| {}),
+            vision: None,
         })
     }
 
@@ -1448,7 +1525,276 @@ mod tests {
             embedding_factory,
             status_sink: Box::new(|_| {}),
             memory_sink,
+            vision: None,
         })
+    }
+
+    /// A dummy vision config the fakes accept; its paths needn't exist.
+    fn vision_config() -> VisionConfig {
+        VisionConfig {
+            model_path: PathBuf::from("vision.gguf"),
+            projector_path: PathBuf::from("projector.gguf"),
+            gpu_layers: 0,
+            max_image_edge: 640,
+            keep_alive: Duration::from_secs(60),
+        }
+    }
+
+    /// A vision service driven by the fakes; call `configure` to turn it on.
+    fn vision_service() -> (Arc<VisionService>, FakeVisionHandle, FakeCaptureHandle) {
+        let (factory, vision) = FakeVision::factory();
+        let (capture, capture_handle) = fake_capture();
+        let service = VisionService::spawn(VisionDeps {
+            factory,
+            capture,
+            sink: Box::new(|_| {}),
+        });
+        (Arc::new(service), vision, capture_handle)
+    }
+
+    /// Starts a service with the given embedding factory, memory sink and
+    /// optional vision service.
+    fn spawn_with_vision(
+        dir: &tempfile::TempDir,
+        factory: EngineFactory,
+        embedding_factory: EmbeddingFactory,
+        memory_sink: MemorySink,
+        vision: Option<Arc<VisionService>>,
+    ) -> ChatService {
+        ChatService::spawn(ChatServiceDeps {
+            db_path: db_path(dir),
+            prefix_cache_dir: prefix_dir(dir),
+            engine_factory: factory,
+            embedding_factory,
+            status_sink: Box::new(|_| {}),
+            memory_sink,
+            vision,
+        })
+    }
+
+    /// A factory whose engine logs every prompt and replies "ok".
+    fn prompt_factory(log: &Arc<Mutex<Vec<Vec<PromptMessage>>>>) -> EngineFactory {
+        let log = Arc::clone(log);
+        Box::new(move |_config| {
+            Ok(Box::new(
+                FakeEngine::new(vec!["ok".to_string()], 4096).with_prompt_log(Arc::clone(&log)),
+            ))
+        })
+    }
+
+    /// The system prompt of one turn with the given optional vision service.
+    fn first_system_prompt(vision: Option<Arc<VisionService>>) -> String {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let service = spawn_with_vision(
+            &dir,
+            prompt_factory(&log),
+            Box::new(|_config| Ok(Box::new(FakeEmbedder::new()))),
+            Box::new(|_| {}),
+            vision,
+        );
+        service.start(Some(config(&dir)), None).expect("start");
+        service
+            .send("hi", &TurnSettings::default(), &mut |_| {})
+            .expect("send");
+        let prompt = prompts(&log).pop().expect("a logged prompt");
+        prompt[0].text.clone()
+    }
+
+    #[test]
+    fn look_at_screen_is_offered_only_when_vision_is_configured() {
+        let (configured, _handle, _capture) = vision_service();
+        configured.configure(Some(vision_config()));
+        assert!(
+            first_system_prompt(Some(configured)).contains("look_at_screen"),
+            "a configured vision service should offer the tool"
+        );
+
+        let (unconfigured, _handle, _capture) = vision_service();
+        assert!(
+            !first_system_prompt(Some(unconfigured)).contains("look_at_screen"),
+            "an unconfigured vision service should not offer the tool"
+        );
+
+        assert!(
+            !first_system_prompt(None).contains("look_at_screen"),
+            "no vision service should not offer the tool"
+        );
+    }
+
+    #[test]
+    fn look_at_screen_answers_through_the_vision_service() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (vision, handle, capture) = vision_service();
+        vision.configure(Some(vision_config()));
+        handle.set_answer("A text editor with code.".to_string());
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory = rounds_factory(
+            vec![
+                vec![
+                    "<tool_call>{\"name\":\"look_at_screen\",\"arguments\":{\"question\":\"What app is open?\"}}</tool_call>",
+                ],
+                vec!["It looks like an editor."],
+            ],
+            Arc::clone(&log),
+        );
+        let service = spawn_with_vision(
+            &dir,
+            factory,
+            Box::new(|_config| Ok(Box::new(FakeEmbedder::new()))),
+            Box::new(|_| {}),
+            Some(Arc::clone(&vision)),
+        );
+        service.start(Some(config(&dir)), None).expect("start");
+
+        let mut events = Vec::new();
+        service
+            .send(
+                "what is on my screen?",
+                &TurnSettings::default(),
+                &mut |event| events.push(event),
+            )
+            .expect("send");
+
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ChatEvent::Tool { name } if name == "look_at_screen")));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ChatEvent::Done { .. })));
+
+        let history = service.history(10).expect("history");
+        let tool = history
+            .iter()
+            .find(|message| message.role == Role::Tool)
+            .expect("a tool row");
+        assert_eq!(tool.tool_name.as_deref(), Some("look_at_screen"));
+        assert!(
+            tool.text.contains("A text editor with code."),
+            "{}",
+            tool.text
+        );
+        assert_eq!(handle.questions(), vec!["What app is open?".to_string()]);
+        assert_eq!(capture.calls(), 1);
+    }
+
+    #[test]
+    fn a_failed_screen_capture_is_reported_in_the_tool_row() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (vision, _handle, capture) = vision_service();
+        vision.configure(Some(vision_config()));
+        capture.fail(Some("No screen.".to_string()));
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory = rounds_factory(
+            vec![
+                vec![
+                    "<tool_call>{\"name\":\"look_at_screen\",\"arguments\":{\"question\":\"What app is open?\"}}</tool_call>",
+                ],
+                vec!["I couldn't see it."],
+            ],
+            Arc::clone(&log),
+        );
+        let service = spawn_with_vision(
+            &dir,
+            factory,
+            Box::new(|_config| Ok(Box::new(FakeEmbedder::new()))),
+            Box::new(|_| {}),
+            Some(Arc::clone(&vision)),
+        );
+        service.start(Some(config(&dir)), None).expect("start");
+
+        let mut events = Vec::new();
+        service
+            .send(
+                "what is on my screen?",
+                &TurnSettings::default(),
+                &mut |event| events.push(event),
+            )
+            .expect("send");
+
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ChatEvent::Done { .. })));
+        let history = service.history(10).expect("history");
+        let tool = history
+            .iter()
+            .find(|message| message.role == Role::Tool)
+            .expect("a tool row");
+        assert_eq!(tool.text, "Couldn't look at the screen: No screen.");
+    }
+
+    #[test]
+    fn a_turn_can_search_memory_then_look_at_the_screen() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = db_path(&dir);
+        {
+            let mut store = ChatStore::open(&path).expect("open store");
+            store
+                .append(Role::User, "hello there", false)
+                .expect("append old user");
+            let second = store
+                .append(Role::Assistant, "My cat is named Pixel", false)
+                .expect("append old assistant");
+            store
+                .append_summary("earlier chat", second.id)
+                .expect("append summary");
+        }
+
+        let (vision, handle, _capture) = vision_service();
+        vision.configure(Some(vision_config()));
+        handle.set_answer("A cat photo.".to_string());
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factory = rounds_factory(
+            vec![
+                vec![
+                    "<tool_call>{\"name\":\"search_memory\",\"arguments\":{\"query\":\"cat named\"}}</tool_call>",
+                ],
+                vec![
+                    "<tool_call>{\"name\":\"look_at_screen\",\"arguments\":{\"question\":\"Is there a cat?\"}}</tool_call>",
+                ],
+                vec!["Yes, Pixel is on screen."],
+            ],
+            Arc::clone(&log),
+        );
+        let (memory_sink, statuses) = recording_memory_sink();
+        let service = spawn_with_vision(
+            &dir,
+            factory,
+            Box::new(|_config| Ok(Box::new(FakeEmbedder::new()))),
+            memory_sink,
+            Some(Arc::clone(&vision)),
+        );
+        service
+            .start(Some(config(&dir)), Some(embedding_config(&dir)))
+            .expect("start");
+        wait_for_memory(&statuses, |status| {
+            status.state == MemoryState::Ready && status.indexed == 2 && status.total == 2
+        })
+        .expect("the old messages should be indexed");
+
+        let mut events = Vec::new();
+        service
+            .send(
+                "what is my cat called?",
+                &TurnSettings::default(),
+                &mut |event| events.push(event),
+            )
+            .expect("send");
+
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ChatEvent::Done { .. })));
+        let history = service.history(20).expect("history");
+        let tools: Vec<&str> = history
+            .iter()
+            .filter(|message| message.role == Role::Tool)
+            .filter_map(|message| message.tool_name.as_deref())
+            .collect();
+        assert_eq!(tools, vec!["search_memory", "look_at_screen"]);
+        assert_eq!(handle.questions(), vec!["Is there a cat?".to_string()]);
     }
 
     /// An embedding config whose model file exists.
@@ -2479,6 +2825,7 @@ mod tests {
             embedding_factory: Box::new(|_config| Ok(Box::new(FakeEmbedder::new()))),
             status_sink: Box::new(|_| {}),
             memory_sink,
+            vision: None,
         });
         (service, statuses)
     }
@@ -2740,5 +3087,88 @@ mod tests {
             .find(|message| message.role == Role::Tool)
             .expect("a tool row");
         assert_eq!(tool.text, NOTHING_INDEXED);
+    }
+
+    #[test]
+    fn reasoning_is_hidden_from_the_reply_and_the_store() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let head = format!("{THINK_OPEN}plan{THINK_CLOSE}\n\n");
+        let service = service(&dir, piece_factory(&[head.as_str(), "Hello"]));
+        service.start(Some(config(&dir)), None).expect("start");
+
+        let mut events = Vec::new();
+        service
+            .send("hi", &TurnSettings::default(), &mut |event| {
+                events.push(event)
+            })
+            .expect("send");
+
+        let tokens: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::Token { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tokens, vec!["Hello"], "{events:?}");
+
+        let history = service.history(10).expect("history");
+        assert_eq!(history[1].text, "Hello");
+    }
+
+    #[test]
+    fn a_tool_call_inside_reasoning_never_runs() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let call = r#"<tool_call>{"name":"search_memory","arguments":{"query":"cat"}}</tool_call>"#;
+        let block = format!("{THINK_OPEN}I could search. {call}{THINK_CLOSE}\n\nHello");
+        let factory = rounds_factory(vec![vec![block.as_str()]], Arc::clone(&log));
+        let (service, _statuses) = spawn_memory_service(&dir, factory);
+        service
+            .start(Some(config(&dir)), Some(embedding_config(&dir)))
+            .expect("start");
+
+        let mut events = Vec::new();
+        service
+            .send("hi", &TurnSettings::default(), &mut |event| {
+                events.push(event)
+            })
+            .expect("send");
+
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, ChatEvent::Tool { .. })));
+        let history = service.history(10).expect("history");
+        assert!(!history.iter().any(|message| message.role == Role::Tool));
+        assert_eq!(history[1].text, "Hello");
+    }
+
+    #[test]
+    fn a_summary_with_reasoning_is_stored_without_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = db_path(&dir);
+        seed(&path, 14, 40);
+        let folded =
+            format!("{THINK_OPEN}plan{THINK_CLOSE}\n\nthe user and regent discussed seeded topics");
+        let factory: EngineFactory =
+            Box::new(move |_config| {
+                Ok(Box::new(
+                    FakeEngine::new(vec!["ok".to_string()], CONTEXT_TOKENS)
+                        .with_summaries(vec![folded.clone(); 4]),
+                ))
+            });
+        let service = spawn_service(path.clone(), prefix_dir(&dir), factory, Box::new(|_| {}));
+        service.start(Some(config(&dir)), None).expect("start");
+
+        service
+            .send(&words(40, "newest_"), &TurnSettings::default(), &mut |_| {})
+            .expect("send");
+
+        let store = ChatStore::open(&path).expect("open a second store");
+        let summary = store
+            .latest_summary()
+            .expect("read summary")
+            .expect("a stored summary");
+        assert_eq!(summary.text, "the user and regent discussed seeded topics");
     }
 }

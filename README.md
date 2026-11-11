@@ -8,9 +8,9 @@ no cloud APIs and no accounts, on Windows first, with macOS and Linux designed i
 start. Regent is being rebuilt as a Tauri v2 app with a Rust backend and a React + Tailwind
 + HeroUI frontend. Status: early development.
 
-## Development (Windows)
+## Development
 
-Prerequisites:
+On Windows, prerequisites:
 
 - Rust stable with the MSVC toolchain
 - Node.js 22+
@@ -28,6 +28,22 @@ The default build also compiles llama.cpp in-process (text engine, behind the de
 `llama` feature of `crates/regent-app`) and whisper.cpp for the `regent-stt` helper
 (behind its default `whisper` feature), so it additionally needs CMake and LLVM/libclang.
 `--no-default-features` builds skip both native engines entirely.
+
+The default build also includes screen capture (the default `screen` feature, which uses
+`xcap`), and vision answers come from llama.cpp's multimodal library through the same
+`llama` feature. On Linux the capture crates need the X11, Wayland and portal development
+packages, on top of Tauri's own prerequisites (which CI lists in full):
+
+```sh
+sudo apt-get install -y --no-install-recommends \
+  libxcb1-dev libxcb-randr0-dev libxcb-util-dev libxrandr-dev \
+  libdbus-1-dev libwayland-dev libpipewire-0.3-dev libspa-0.2-dev \
+  libgbm-dev libegl1-mesa-dev
+```
+
+That is the same list `.github/workflows/ci.yml` installs on Ubuntu 24.04; without it the
+default build fails while compiling `xcap`. `--no-default-features` builds need none of
+them. See `docs/decisions/0008-vision.md` for how vision works.
 
 ## Speech-to-text helper
 
