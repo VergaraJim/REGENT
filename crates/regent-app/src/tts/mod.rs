@@ -5,7 +5,9 @@
 //! text to its stdin and reads raw little-endian `i16` samples from its stdout.
 
 pub mod piper;
+pub mod synth;
 
 pub use piper::{
     piper_command, resolve_piper, synthesize_once, voice_config_path, PiperPaths, TtsError,
 };
+pub use synth::{synth_factory, PiperSynthesizer};
