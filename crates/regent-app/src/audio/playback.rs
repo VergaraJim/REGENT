@@ -12,27 +12,99 @@
 //! audio thread never blocks. [`AudioOut::play`] resamples to the device rate
 //! and appends to the queue; [`AudioOut::stop`] clears it; [`AudioOut::is_idle`]
 //! reports whether anything is left.
+//!
+//! # Failed devices
+//!
+//! When the device disappears mid-playback (headphones unplugged, for example)
+//! `cpal` stops calling the realtime callback and reports the problem to a
+//! separate error callback instead. That callback only marks the queue broken:
+//! it never blocks. A broken queue then drains itself and reports idle, so the
+//! voice service stops waiting for audio, and refuses further playback with
+//! [`AUDIO_FAILED`], so the player drops the device and opens a fresh one for
+//! the next reply.
 
 #[cfg(feature = "audio")]
 use std::collections::VecDeque;
 #[cfg(feature = "audio")]
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "audio")]
+use std::sync::{Mutex, MutexGuard};
 
 use regent_core::voice::AudioOutFactory;
 
 #[cfg(not(feature = "audio"))]
 use super::NO_AUDIO;
 
+#[cfg(feature = "audio")]
+use regent_core::voice::AUDIO_FAILED;
+
+/// The sample queue shared with the realtime callback, plus whether the device
+/// has failed.
+///
+/// A device that reports an error is *broken*: its callback has stopped, so
+/// nothing would ever drain the queue. [`OutputQueue::is_idle`] therefore
+/// empties it and reports idle, and [`OutputQueue::push`] refuses new samples,
+/// so playback never waits on a device that cannot play.
+#[cfg(feature = "audio")]
+#[derive(Default)]
+struct OutputQueue {
+    samples: Mutex<VecDeque<f32>>,
+    broken: AtomicBool,
+}
+
+#[cfg(feature = "audio")]
+impl OutputQueue {
+    fn samples(&self) -> MutexGuard<'_, VecDeque<f32>> {
+        // A panic while holding the lock must not take playback down with it.
+        self.samples
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Appends mono samples, unless the device has failed.
+    fn push(&self, samples: impl IntoIterator<Item = f32>) -> Result<(), String> {
+        if self.is_broken() {
+            return Err(AUDIO_FAILED.to_string());
+        }
+        self.samples().extend(samples);
+        Ok(())
+    }
+
+    /// Drops every queued sample.
+    fn clear(&self) {
+        self.samples().clear();
+    }
+
+    /// Whether nothing is left to play; a broken device is always idle.
+    fn is_idle(&self) -> bool {
+        if self.is_broken() {
+            self.clear();
+            return true;
+        }
+        self.samples().is_empty()
+    }
+
+    /// Records that the device stopped working; called from the error callback.
+    fn mark_broken(&self) {
+        self.broken.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the device stopped working.
+    fn is_broken(&self) -> bool {
+        self.broken.load(Ordering::SeqCst)
+    }
+}
+
 /// How a callback writes one mono sample into every channel.
 #[cfg(feature = "audio")]
 fn write_chunk<T: Copy>(
     data: &mut [T],
     channels: usize,
-    queue: &Mutex<VecDeque<f32>>,
+    queue: &OutputQueue,
     convert: impl Fn(f32) -> T,
 ) {
     let channels = channels.max(1);
-    let Ok(mut queue) = queue.try_lock() else {
+    let Ok(mut queue) = queue.samples.try_lock() else {
         data.fill(convert(0.0));
         return;
     };
@@ -46,9 +118,8 @@ fn write_chunk<T: Copy>(
 
 #[cfg(feature = "audio")]
 mod imp {
-    use std::collections::VecDeque;
     use std::sync::mpsc::{self, Receiver, SyncSender};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::thread::{self, JoinHandle};
 
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -57,7 +128,7 @@ mod imp {
 
     use crate::audio::{f32_to_i16, f32_to_u16, DEVICE_OPEN_TIMEOUT, NO_SPEAKERS};
 
-    use super::write_chunk;
+    use super::{write_chunk, OutputQueue};
     use regent_core::voice::AUDIO_FAILED;
 
     /// What the output thread reports once the device is playing.
@@ -68,7 +139,7 @@ mod imp {
     /// A playing output device: the shared queue, the stream thread and the
     /// signal that stops it.
     pub struct CpalAudioOut {
-        queue: Arc<Mutex<VecDeque<f32>>>,
+        queue: Arc<OutputQueue>,
         device_rate: u32,
         stop_tx: Option<SyncSender<()>>,
         stream: Option<JoinHandle<()>>,
@@ -79,23 +150,15 @@ mod imp {
             let mut resampler = Resampler::new(sample_rate, self.device_rate);
             let mut converted = Vec::new();
             resampler.process(samples, &mut converted);
-            if let Ok(mut queue) = self.queue.lock() {
-                queue.extend(converted);
-            }
-            Ok(())
+            self.queue.push(converted)
         }
 
         fn stop(&mut self) {
-            if let Ok(mut queue) = self.queue.lock() {
-                queue.clear();
-            }
+            self.queue.clear();
         }
 
         fn is_idle(&self) -> bool {
-            self.queue
-                .lock()
-                .map(|queue| queue.is_empty())
-                .unwrap_or(true)
+            self.queue.is_idle()
         }
     }
 
@@ -110,7 +173,7 @@ mod imp {
 
     /// Opens the default output device and starts the stream thread.
     pub fn open_output() -> Result<Box<dyn AudioOut>, String> {
-        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let queue = Arc::new(OutputQueue::default());
         let (open_tx, open_rx) = mpsc::channel();
         let (stop_tx, stop_rx) = mpsc::sync_channel(1);
 
@@ -144,7 +207,7 @@ mod imp {
     fn run_stream(
         open_tx: mpsc::Sender<Result<DeviceInfo, String>>,
         stop_rx: Receiver<()>,
-        queue: Arc<Mutex<VecDeque<f32>>>,
+        queue: Arc<OutputQueue>,
     ) {
         let host = cpal::default_host();
         let Some(device) = host.default_output_device() else {
@@ -164,7 +227,9 @@ mod imp {
         let channels = config.channels as usize;
         let sample_rate = config.sample_rate.0;
 
-        let error_callback = move |_error: cpal::StreamError| {};
+        // The error callback runs on an audio thread, so it only stores a flag.
+        let errors = Arc::clone(&queue);
+        let error_callback = move |_error: cpal::StreamError| errors.mark_broken();
 
         let built = match format {
             SampleFormat::F32 => {
@@ -240,4 +305,51 @@ pub fn audio_out_factory() -> AudioOutFactory {
 #[cfg(not(feature = "audio"))]
 pub fn audio_out_factory() -> AudioOutFactory {
     Box::new(|| Err(NO_AUDIO.to_string()))
+}
+
+#[cfg(all(feature = "audio", test))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pushing_samples_makes_the_queue_busy() {
+        let queue = OutputQueue::default();
+        assert!(queue.is_idle());
+
+        queue.push([0.5, 0.25]).expect("a working device queues");
+
+        assert!(!queue.is_idle());
+    }
+
+    #[test]
+    fn a_broken_queue_is_idle_and_empty() {
+        let queue = OutputQueue::default();
+        queue.push([0.5; 8]).expect("a working device queues");
+
+        queue.mark_broken();
+
+        assert!(queue.is_broken());
+        assert!(queue.is_idle());
+        assert!(queue.samples().is_empty());
+    }
+
+    #[test]
+    fn a_broken_queue_refuses_playback() {
+        let queue = OutputQueue::default();
+        queue.mark_broken();
+
+        assert_eq!(queue.push([0.5]), Err(AUDIO_FAILED.to_string()));
+        assert!(queue.is_idle());
+    }
+
+    #[test]
+    fn clearing_drops_queued_samples() {
+        let queue = OutputQueue::default();
+        queue.push([0.5; 4]).expect("a working device queues");
+
+        queue.clear();
+
+        assert!(queue.is_idle());
+        assert!(queue.samples().is_empty());
+    }
 }

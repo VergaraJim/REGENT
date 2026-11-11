@@ -335,14 +335,16 @@ fn play_sentence(
     sample_rate: u32,
 ) {
     if audio.is_none() {
-        if *error_reported {
-            return;
-        }
+        // Always try again after a failure, even within the same reply: a
+        // re-plugged device works without restarting Regent. Only the message
+        // is reported once.
         match factory() {
             Ok(out) => *audio = Some(out),
             Err(_) => {
-                *error_reported = true;
-                shared.emit(SpeakerEvent::Error(AUDIO_FAILED.to_string()));
+                if !*error_reported {
+                    *error_reported = true;
+                    shared.emit(SpeakerEvent::Error(AUDIO_FAILED.to_string()));
+                }
                 return;
             }
         }
@@ -578,6 +580,9 @@ struct FakeAudioState {
     busy_until: Instant,
     plays: Vec<(usize, u32)>,
     stops: usize,
+    opens: usize,
+    /// How many of the next plays must fail as if the device had gone away.
+    fail_plays: usize,
     open_error: Option<String>,
     last_end: Option<Instant>,
 }
@@ -592,18 +597,22 @@ impl FakeAudioOut {
             busy_until: Instant::now(),
             plays: Vec::new(),
             stops: 0,
+            opens: 0,
+            fail_plays: 0,
             open_error: None,
             last_end: None,
         }));
         let factory_state = Arc::clone(&state);
         let factory: AudioOutFactory = Box::new(move || {
-            let open_error = factory_state.lock().unwrap().open_error.clone();
-            match open_error {
-                Some(message) => Err(message),
-                None => Ok(Box::new(FakeAudioOutInstance {
-                    state: Arc::clone(&factory_state),
-                }) as Box<dyn AudioOut>),
+            let mut state = factory_state.lock().unwrap();
+            if let Some(message) = state.open_error.clone() {
+                return Err(message);
             }
+            state.opens += 1;
+            drop(state);
+            Ok(Box::new(FakeAudioOutInstance {
+                state: Arc::clone(&factory_state),
+            }) as Box<dyn AudioOut>)
         });
         (factory, FakeAudioHandle { state })
     }
@@ -631,6 +640,16 @@ impl FakeAudioHandle {
         self.state.lock().unwrap().open_error = message;
     }
 
+    /// How many times the audio output was opened.
+    pub fn opens(&self) -> usize {
+        self.state.lock().unwrap().opens
+    }
+
+    /// Makes the next play fail, as if the output device had gone away.
+    pub fn fail_next_play(&self) {
+        self.state.lock().unwrap().fail_plays = 1;
+    }
+
     /// When the audio queued so far is expected to finish, if anything played.
     pub fn last_audio_end(&self) -> Option<Instant> {
         self.state.lock().unwrap().last_end
@@ -644,6 +663,10 @@ struct FakeAudioOutInstance {
 impl AudioOut for FakeAudioOutInstance {
     fn play(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), String> {
         let mut state = self.state.lock().unwrap();
+        if state.fail_plays > 0 {
+            state.fail_plays -= 1;
+            return Err(AUDIO_FAILED.to_string());
+        }
         let now = Instant::now();
         let start = if now >= state.busy_until {
             now
@@ -865,6 +888,26 @@ mod tests {
         thread::sleep(Duration::from_millis(200));
         assert_eq!(harness.errors(), [AUDIO_FAILED.to_string()]);
         assert!(harness.audio.plays().is_empty());
+    }
+
+    #[test]
+    fn a_failed_play_reopens_the_device_for_the_next_reply() {
+        let harness = Harness::new();
+        harness.audio.fail_next_play();
+        harness.speaker.set_voice(Some(voice_path()));
+        harness.speaker.push("Hello there.");
+        harness.speaker.end_reply();
+
+        wait_until(|| (!harness.errors().is_empty()).then_some(()));
+        assert_eq!(harness.errors(), [AUDIO_FAILED.to_string()]);
+        assert!(harness.audio.plays().is_empty());
+        assert_eq!(harness.audio.opens(), 1);
+
+        harness.speaker.push("A fresh reply.");
+        harness.speaker.end_reply();
+
+        wait_until(|| (!harness.audio.plays().is_empty()).then_some(()));
+        assert_eq!(harness.audio.opens(), 2, "the device was opened again");
     }
 
     #[test]
