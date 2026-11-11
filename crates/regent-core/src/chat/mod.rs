@@ -27,7 +27,8 @@ pub use prompt::{
     SYSTEM_PROMPT,
 };
 pub use service::{
-    ChatEvent, ChatService, ChatState, ChatStatus, EngineFactory, StatusSink, TurnSettings,
+    ChatEvent, ChatService, ChatServiceDeps, ChatState, ChatStatus, EngineFactory, StatusSink,
+    TurnSettings,
 };
 pub use store::{ChatStore, ChatStoreError, Summary, HISTORY_READ_CAP};
 pub use tools::{

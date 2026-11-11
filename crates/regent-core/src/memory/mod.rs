@@ -14,15 +14,19 @@
 //! [`markers::model_id`].
 
 pub mod chunk;
+pub mod engine;
 pub mod markers;
 pub mod recall;
+pub mod status;
 pub mod vector;
 
 pub use chunk::{chunk_text, CHUNK_CHARS, CHUNK_OVERLAP_CHARS};
+pub use engine::{EmbeddingConfig, EmbeddingEngine, EmbeddingFactory, FakeEmbedder};
 pub use markers::{detect_markers, model_id, resolve_markers, Markers};
 pub use recall::{
     format_date, format_recall, NOTHING_INDEXED, NO_MATCHES, RECALL_MAX_CHARS, SNIPPET_CHARS,
 };
+pub use status::{MemorySink, MemoryState, MemoryStatus};
 pub use vector::{dot, normalize, Hit, VectorIndex};
 
 /// How many messages are embedded per indexing batch before the index writes

@@ -6,9 +6,10 @@
 
 use std::sync::Mutex;
 
-use regent_core::chat::{ChatService, EngineFactory};
+use regent_core::chat::{ChatEngineError, ChatService, ChatServiceDeps, EngineFactory};
 use regent_core::estimate::{Estimate, Estimator, FsInspector};
 use regent_core::hardware::SystemProbe;
+use regent_core::memory::EmbeddingFactory;
 use regent_core::paths::AppPaths;
 use regent_core::settings::{Settings, SettingsStore};
 use serde::Serialize;
@@ -20,9 +21,20 @@ pub const ESTIMATE_READY: &str = "estimate-ready";
 /// The event emitted whenever the chat service changes state.
 pub const CHAT_STATE: &str = "chat-state";
 
+/// The event emitted whenever the memory indexer changes state.
+pub const MEMORY_STATUS: &str = "memory-status";
+
 /// The error reported by a build without the llama feature.
 #[cfg(not(feature = "llama"))]
 const NO_ENGINE: &str = "This build of Regent has no text engine.";
+
+/// The placeholder memory-engine error for a build with the llama feature.
+#[cfg(feature = "llama")]
+const NO_MEMORY_ENGINE: &str = "This build of Regent can't load memory models yet.";
+
+/// The placeholder memory-engine error for a build without the llama feature.
+#[cfg(not(feature = "llama"))]
+const NO_MEMORY_ENGINE: &str = "This build of Regent has no memory engine.";
 
 /// The payload of [`ESTIMATE_READY`].
 #[derive(Debug, Clone, Serialize)]
@@ -67,14 +79,20 @@ impl AppState {
                 let _ = estimate_app.emit(ESTIMATE_READY, payload);
             }),
         );
-        let chat = ChatService::spawn(
-            paths.database_file.clone(),
-            paths.prefix_cache_dir.clone(),
-            engine_factory(),
-            Box::new(move |status| {
-                let _ = app.emit(CHAT_STATE, status);
+        let chat_app = app.clone();
+        let memory_app = app.clone();
+        let chat = ChatService::spawn(ChatServiceDeps {
+            db_path: paths.database_file.clone(),
+            prefix_cache_dir: paths.prefix_cache_dir.clone(),
+            engine_factory: engine_factory(),
+            embedding_factory: embedding_factory(),
+            status_sink: Box::new(move |status| {
+                let _ = chat_app.emit(CHAT_STATE, status);
             }),
-        );
+            memory_sink: Box::new(move |status| {
+                let _ = memory_app.emit(MEMORY_STATUS, status);
+            }),
+        });
 
         Self {
             store: Mutex::new(store),
@@ -107,4 +125,12 @@ fn engine_factory() -> EngineFactory {
     {
         Box::new(|_config| Err(regent_core::chat::ChatEngineError(NO_ENGINE.to_string())))
     }
+}
+
+/// Builds the embedding factory for this build.
+///
+/// The real embedder arrives in a later stage; for now memory stays off with a
+/// readable error when a memory model is chosen.
+fn embedding_factory() -> EmbeddingFactory {
+    Box::new(|_config| Err(ChatEngineError(NO_MEMORY_ENGINE.to_string())))
 }
