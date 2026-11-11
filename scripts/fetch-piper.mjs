@@ -6,7 +6,8 @@
 // Usage: node scripts/fetch-piper.mjs
 //
 // Skips all network access when crates/regent-app/resources/piper/.fetched already
-// carries the expected SHA-256 and the piper executable is present.
+// carries the expected SHA-256 plus the current layout version and the piper executable
+// is present.
 
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
@@ -33,6 +34,11 @@ const manifestPath = join(repoRoot, 'third_party', 'piper', 'manifest.json');
 const resourceDir = join(repoRoot, 'crates', 'regent-app', 'resources', 'piper');
 const stampPath = join(resourceDir, '.fetched');
 const manifestLabel = 'third_party/piper/manifest.json';
+
+// Bumped whenever the installed folder layout changes, so existing installs re-fetch
+// even though their archive SHA-256 still matches.
+// 2: symlinks in the archive are copied as their dereferenced regular files.
+const LAYOUT_VERSION = 2;
 
 class FetchError extends Error {}
 
@@ -184,6 +190,11 @@ function failVcRuntime() {
   );
 }
 
+// The stamp records both the archive SHA-256 and the layout it was copied with.
+function stampValue(sha256) {
+  return `${sha256} layout-${LAYOUT_VERSION}`;
+}
+
 function ensureVcRuntime(triple) {
   if (!triple.includes('windows')) return;
 
@@ -207,6 +218,10 @@ function ensureVcRuntime(triple) {
   );
 }
 
+// Copies `from` into `to`, dereferencing symlinks: the Linux Piper archive ships its
+// libraries as a real versioned file plus links the executable loads by name. Copying
+// the link targets as regular files keeps those names working, and regular files also
+// survive Tauri bundling and Windows checkouts.
 function copyDir(from, to) {
   mkdirSync(to, { recursive: true });
   for (const entry of readdirSync(from, { withFileTypes: true })) {
@@ -216,6 +231,19 @@ function copyDir(from, to) {
       copyDir(source, target);
     } else if (entry.isFile()) {
       copyFileSync(source, target);
+    } else if (entry.isSymbolicLink()) {
+      let stat;
+      try {
+        stat = statSync(source);
+      } catch {
+        console.warn(`fetch-piper: skipping dangling link ${relative(repoRoot, source)}`);
+        continue;
+      }
+      if (stat.isDirectory()) {
+        copyDir(source, target);
+      } else if (stat.isFile()) {
+        copyFileSync(source, target);
+      }
     }
   }
 }
@@ -250,7 +278,7 @@ async function main() {
   if (
     existsSync(join(resourceDir, exeName)) &&
     existsSync(stampPath) &&
-    readFileSync(stampPath, 'utf8').trim() === sha256
+    readFileSync(stampPath, 'utf8').trim() === stampValue(sha256)
   ) {
     console.log(`Piper already present (${triple})`);
     ensureVcRuntime(triple);
@@ -296,7 +324,7 @@ async function main() {
 
     mkdirSync(resourceDir, { recursive: true });
     copyDir(extractedPiper, resourceDir);
-    writeFileSync(stampPath, `${sha256}\n`);
+    writeFileSync(stampPath, `${stampValue(sha256)}\n`);
     installed = true;
     console.log(
       `fetch-piper: installed Piper ${manifest.version} into ${relative(repoRoot, resourceDir)}`,
