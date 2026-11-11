@@ -12,6 +12,7 @@ use regent_core::chat::{
 use regent_core::estimate::SlotId;
 use regent_core::memory::{EmbeddingConfig, MemoryStatus};
 use regent_core::settings::{SaveError, Settings, SettingsStore};
+use regent_core::voice::{SttConfig, VoiceStatus};
 use serde::Serialize;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
@@ -182,33 +183,47 @@ pub async fn request_estimate(app: AppHandle, settings: Option<Settings>) -> u64
 /// has to show them.
 #[tauri::command]
 pub async fn start_chat(app: AppHandle) -> Result<(), CommandError> {
-    let (config, embedding) = {
-        let state = app.state::<AppState>();
-        let settings = state.settings();
-        (engine_config(&settings), embedding_config(&settings))
-    };
+    let settings = app.state::<AppState>().settings();
+    let config = engine_config(&settings);
+    let embedding = embedding_config(&settings);
+    let stt = stt_config(&settings);
+    let voice = settings.models.tts.voice_path.clone();
     let handle = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        handle.state::<AppState>().chat.start(config, embedding)
+        let state = handle.state::<AppState>();
+        state
+            .chat
+            .start(config, embedding)
+            .map_err(CommandError::new)?;
+        state.voice.start(stt);
+        state.speaker.set_voice(voice);
+        Ok(())
     })
     .await
     .map_err(|_| CommandError::new(CHAT_TASK_FAILED))?
-    .map_err(CommandError::new)
 }
 
 /// Drops the text model and stops any reply that is streaming.
 #[tauri::command]
 pub async fn stop_chat(app: AppHandle) -> Result<(), CommandError> {
     let handle = app.clone();
-    tauri::async_runtime::spawn_blocking(move || handle.state::<AppState>().chat.stop())
-        .await
-        .map_err(|_| CommandError::new(CHAT_TASK_FAILED))
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = handle.state::<AppState>();
+        state.speaker.stop();
+        state.speaker.set_voice(None);
+        state.voice.stop();
+        state.chat.stop();
+    })
+    .await
+    .map_err(|_| CommandError::new(CHAT_TASK_FAILED))
 }
 
 /// Stops the reply that is currently streaming, if any.
 #[tauri::command]
 pub async fn cancel_generation(app: AppHandle) {
-    app.state::<AppState>().chat.cancel();
+    let state = app.state::<AppState>();
+    state.chat.cancel();
+    state.speaker.stop();
 }
 
 /// The chat service's current state.
@@ -240,29 +255,69 @@ pub async fn get_history(app: AppHandle) -> Result<Vec<ChatMessage>, CommandErro
 pub async fn send_message(
     app: AppHandle,
     text: String,
+    from_voice: Option<bool>,
     on_event: Channel<ChatEvent>,
 ) -> Result<(), CommandError> {
-    let settings = {
+    let (settings, speak) = {
         let state = app.state::<AppState>();
         let settings = state.settings();
-        TurnSettings {
+        let turn = TurnSettings {
             system_addition: settings.system_prompt_addition.clone(),
             compaction: settings.compaction.clone(),
             persist_prefix_cache: settings.persist_prefix_cache,
-        }
+        };
+        (turn, settings.voice.speak_replies)
     };
     let handle = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        handle
-            .state::<AppState>()
-            .chat
-            .send(&text, &settings, &mut |event| {
+        let state = handle.state::<AppState>();
+        // A new turn cuts any speech left over from the last one.
+        state.speaker.stop();
+        state.chat.send_from(
+            &text,
+            from_voice.unwrap_or(false),
+            &settings,
+            &mut |event| {
+                if let ChatEvent::Token { text } = &event {
+                    if speak {
+                        state.speaker.push(text);
+                    }
+                }
+                if matches!(
+                    &event,
+                    ChatEvent::Done { .. } | ChatEvent::Cancelled { .. } | ChatEvent::Error { .. }
+                ) {
+                    state.speaker.end_reply();
+                }
                 let _ = on_event.send(event);
-            })
+            },
+        )
     })
     .await
     .map_err(|_| CommandError::new(CHAT_TASK_FAILED))?
     .map_err(CommandError::new)
+}
+
+/// Opens or closes the microphone for voice input.
+#[tauri::command]
+pub async fn set_listening(app: AppHandle, on: bool) -> Result<(), CommandError> {
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || handle.state::<AppState>().voice.set_listening(on))
+        .await
+        .map_err(|_| CommandError::new(CHAT_TASK_FAILED))?
+        .map_err(CommandError::new)
+}
+
+/// The voice input service's current state.
+#[tauri::command]
+pub async fn get_voice_status(app: AppHandle) -> VoiceStatus {
+    app.state::<AppState>().voice.status()
+}
+
+/// Cuts any speech that is playing now.
+#[tauri::command]
+pub async fn stop_speaking(app: AppHandle) {
+    app.state::<AppState>().speaker.stop();
 }
 
 /// The text model configuration from the settings, or `None` when no model is
@@ -286,6 +341,16 @@ fn embedding_config(settings: &Settings) -> Option<EmbeddingConfig> {
         context_size: slot.context_size,
         document_prefix: slot.document_prefix.clone(),
         query_prefix: slot.query_prefix.clone(),
+    })
+}
+
+/// The speech-to-text configuration from the settings, or `None` when no
+/// speech model is chosen.
+fn stt_config(settings: &Settings) -> Option<SttConfig> {
+    let slot = &settings.models.stt;
+    slot.path.as_ref().map(|path| SttConfig {
+        model_path: path.clone(),
+        language: slot.language.clone(),
     })
 }
 
@@ -352,6 +417,8 @@ mod tests {
     use regent_core::hardware::testing::FakeProbe;
     use regent_core::hardware::{CpuInfo, GpuReport, RamInfo};
 
+    use crate::state::{MicLevel, SpeakingPayload, VoiceOutputError, VoiceTranscript};
+
     use super::*;
 
     /// An inspector that answers "not found" for every file.
@@ -410,6 +477,70 @@ mod tests {
         assert_eq!(
             piper_config_path(voice),
             PathBuf::from("C:/voices/en_US.onnx.json")
+        );
+    }
+
+    #[test]
+    fn stt_config_is_none_without_a_model_path() {
+        let settings = Settings::default();
+        assert!(stt_config(&settings).is_none());
+    }
+
+    #[test]
+    fn stt_config_copies_the_path_and_language() {
+        let mut settings = Settings::default();
+        settings.models.stt.path = Some(PathBuf::from("C:/models/ggml-base.bin"));
+        settings.models.stt.language = "fr".to_string();
+
+        let config = stt_config(&settings).expect("a config when a path is set");
+        assert_eq!(config.model_path, PathBuf::from("C:/models/ggml-base.bin"));
+        assert_eq!(config.language, "fr");
+    }
+
+    #[test]
+    fn voice_payloads_serialise_as_documented() {
+        assert_eq!(
+            serde_json::to_value(MicLevel { level: 0.5 }).expect("a level serialises"),
+            serde_json::json!({ "level": 0.5 })
+        );
+        assert_eq!(
+            serde_json::to_value(VoiceTranscript {
+                text: "hi".to_string()
+            })
+            .expect("a transcript serialises"),
+            serde_json::json!({ "text": "hi" })
+        );
+        assert_eq!(
+            serde_json::to_value(SpeakingPayload { speaking: true })
+                .expect("a speaking payload serialises"),
+            serde_json::json!({ "speaking": true })
+        );
+        assert_eq!(
+            serde_json::to_value(VoiceOutputError {
+                message: "x".to_string()
+            })
+            .expect("an error serialises"),
+            serde_json::json!({ "message": "x" })
+        );
+    }
+
+    #[test]
+    fn voice_status_serialises_as_documented() {
+        let status = VoiceStatus {
+            state: regent_core::voice::VoiceState::Ready,
+            listening: true,
+            paused: false,
+            error: None,
+        };
+
+        assert_eq!(
+            serde_json::to_value(status).expect("a status serialises"),
+            serde_json::json!({
+                "state": "ready",
+                "listening": true,
+                "paused": false,
+                "error": null
+            })
         );
     }
 }

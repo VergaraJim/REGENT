@@ -53,6 +53,9 @@ pub fn run() {
             commands::get_chat_state,
             commands::get_memory_status,
             commands::get_history,
+            commands::set_listening,
+            commands::get_voice_status,
+            commands::stop_speaking,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Regent");
