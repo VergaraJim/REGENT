@@ -6,7 +6,9 @@
 
 use std::sync::Mutex;
 
-use regent_core::chat::{ChatEngineError, ChatService, ChatServiceDeps, EngineFactory};
+#[cfg(not(feature = "llama"))]
+use regent_core::chat::ChatEngineError;
+use regent_core::chat::{ChatService, ChatServiceDeps, EngineFactory};
 use regent_core::estimate::{Estimate, Estimator, FsInspector};
 use regent_core::hardware::SystemProbe;
 use regent_core::memory::EmbeddingFactory;
@@ -27,10 +29,6 @@ pub const MEMORY_STATUS: &str = "memory-status";
 /// The error reported by a build without the llama feature.
 #[cfg(not(feature = "llama"))]
 const NO_ENGINE: &str = "This build of Regent has no text engine.";
-
-/// The placeholder memory-engine error for a build with the llama feature.
-#[cfg(feature = "llama")]
-const NO_MEMORY_ENGINE: &str = "This build of Regent can't load memory models yet.";
 
 /// The placeholder memory-engine error for a build without the llama feature.
 #[cfg(not(feature = "llama"))]
@@ -128,9 +126,16 @@ fn engine_factory() -> EngineFactory {
 }
 
 /// Builds the embedding factory for this build.
-///
-/// The real embedder arrives in a later stage; for now memory stays off with a
-/// readable error when a memory model is chosen.
 fn embedding_factory() -> EmbeddingFactory {
-    Box::new(|_config| Err(ChatEngineError(NO_MEMORY_ENGINE.to_string())))
+    #[cfg(feature = "llama")]
+    {
+        Box::new(|config| {
+            crate::engine::LlamaEmbeddingEngine::load(config)
+                .map(|engine| Box::new(engine) as Box<dyn regent_core::memory::EmbeddingEngine>)
+        })
+    }
+    #[cfg(not(feature = "llama"))]
+    {
+        Box::new(|_config| Err(ChatEngineError(NO_MEMORY_ENGINE.to_string())))
+    }
 }
