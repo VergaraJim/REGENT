@@ -105,6 +105,10 @@ npm run tauri build
 builds the release frontend once, then the Rust backend and the installers. Run `npm ci`
 and `npm run build` first so `dist/` exists and dependencies are installed.
 
+## Testing
+
+Manual test guide: [docs/manual-testing.md](docs/manual-testing.md)
+
 ## Continuous integration
 
 `.github/workflows/ci.yml` runs on every push to `main` and on every pull request, on
