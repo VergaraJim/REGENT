@@ -1,5 +1,6 @@
 //! Locating and driving the bundled Piper executable.
 
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -92,10 +93,25 @@ pub fn voice_config_path(voice: &Path) -> Result<PathBuf, TtsError> {
     Ok(path)
 }
 
+/// `dir` followed by the entries already in the loader's path variable.
+///
+/// Building the value here keeps the platform tricks out of the test-only assertions.
+fn library_path(dir: &Path, existing: Option<OsString>) -> OsString {
+    let mut entries = vec![dir.to_path_buf()];
+    if let Some(existing) = existing {
+        if !existing.is_empty() {
+            entries.extend(std::env::split_paths(&existing));
+        }
+    }
+    std::env::join_paths(entries).unwrap_or_else(|_| dir.as_os_str().to_os_string())
+}
+
 /// Builds the Piper command for one voice.
 ///
 /// The child runs with the Piper folder as its working directory, so its own shared
 /// libraries and data are found next to the executable in dev and in installed builds.
+/// The loader is also pointed at that folder: Piper is not built with an `$ORIGIN`
+/// rpath, so the libraries next to the executable are only found through this path.
 pub fn piper_command(paths: &PiperPaths, voice: &Path) -> Command {
     let mut command = Command::new(&paths.exe);
     command
@@ -107,6 +123,15 @@ pub fn piper_command(paths: &PiperPaths, voice: &Path) -> Command {
 
     if let Some(dir) = paths.exe.parent() {
         command.current_dir(dir);
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            #[cfg(target_os = "linux")]
+            let variable = "LD_LIBRARY_PATH";
+            #[cfg(target_os = "macos")]
+            let variable = "DYLD_LIBRARY_PATH";
+            command.env(variable, library_path(dir, std::env::var_os(variable)));
+        }
     }
 
     command
@@ -189,5 +214,60 @@ mod tests {
 
         assert_eq!(paths.exe, piper_dir.join(format!("piper{EXE_SUFFIX}")));
         assert_eq!(paths.espeak_data, piper_dir.join("espeak-ng-data"));
+    }
+
+    /// With nothing inherited, the loader path is just the Piper folder.
+    #[test]
+    fn library_path_without_existing_value_is_the_dir() {
+        let dir = Path::new("/opt/regent/piper");
+
+        let value = library_path(dir, None);
+
+        let entries: Vec<PathBuf> = std::env::split_paths(&value).collect();
+        assert_eq!(entries, vec![dir.to_path_buf()]);
+    }
+
+    /// An inherited value keeps all of its entries, after the Piper folder.
+    #[test]
+    fn library_path_puts_the_dir_first() {
+        let dir = Path::new("/opt/regent/piper");
+        let existing =
+            std::env::join_paths([Path::new("/usr/lib"), Path::new("/lib")]).expect("join paths");
+
+        let value = library_path(dir, Some(existing));
+
+        let entries: Vec<PathBuf> = std::env::split_paths(&value).collect();
+        assert_eq!(
+            entries,
+            vec![
+                dir.to_path_buf(),
+                PathBuf::from("/usr/lib"),
+                PathBuf::from("/lib")
+            ]
+        );
+    }
+
+    /// The spawned child must be told where its libraries are on Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_command_sets_library_path_to_the_piper_folder() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let folder = temp.path().join("piper");
+        let paths = PiperPaths {
+            exe: folder.join(format!("piper{EXE_SUFFIX}")),
+            espeak_data: folder.join("espeak-ng-data"),
+        };
+
+        let command = piper_command(&paths, &temp.path().join("voice.onnx"));
+        let value = command
+            .get_envs()
+            .find(|(name, _)| *name == "LD_LIBRARY_PATH")
+            .and_then(|(_, value)| value)
+            .expect("LD_LIBRARY_PATH should be set");
+
+        let first = std::env::split_paths(value)
+            .next()
+            .expect("at least one entry");
+        assert_eq!(first, folder);
     }
 }
