@@ -61,6 +61,16 @@ jobs:
           libayatana-appindicator3-dev
           librsvg2-dev
           libasound2-dev
+          libxcb1-dev
+          libxcb-randr0-dev
+          libxcb-util-dev
+          libxrandr-dev
+          libdbus-1-dev
+          libwayland-dev
+          libpipewire-0.3-dev
+          libspa-0.2-dev
+          libgbm-dev
+          libegl1-mesa-dev
           cmake
           clang
           libclang-dev
