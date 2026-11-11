@@ -95,7 +95,11 @@ describe("useChat", () => {
       chat.current().send("Hello");
     });
 
-    expect(api.sendMessage).toHaveBeenCalledWith("Hello", expect.any(Function));
+    expect(api.sendMessage).toHaveBeenCalledWith(
+      "Hello",
+      expect.any(Function),
+      false,
+    );
     expect(chat.current().messages.map((message) => message.text)).toEqual([
       "Hello",
     ]);
@@ -267,7 +271,11 @@ describe("useChat", () => {
       chat.current().send("Hello");
     });
 
-    expect(api.sendMessage).toHaveBeenCalledWith("Hello", expect.any(Function));
+    expect(api.sendMessage).toHaveBeenCalledWith(
+      "Hello",
+      expect.any(Function),
+      false,
+    );
     expect(chat.current().chatState).toBe("generating");
     chat.unmount();
   });
@@ -355,6 +363,26 @@ describe("useChat", () => {
     expect(api.stopChat).toHaveBeenCalledTimes(1);
     expect(chat.current().messages).toHaveLength(1);
     expect(chat.current().chatState).toBe("stopped");
+    chat.unmount();
+  });
+
+  it("marks a voice send as a voice turn", async () => {
+    const chat = await mount({ state: "ready", error: null });
+
+    await act(async () => {
+      chat.current().send("hi", true);
+    });
+
+    expect(api.sendMessage).toHaveBeenCalledWith(
+      "hi",
+      expect.any(Function),
+      true,
+    );
+    expect(chat.current().messages[0]).toMatchObject({
+      role: "user",
+      text: "hi",
+      from_voice: true,
+    });
     chat.unmount();
   });
 

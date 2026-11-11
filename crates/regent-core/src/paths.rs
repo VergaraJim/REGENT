@@ -17,6 +17,8 @@ pub struct AppPaths {
     pub database_file: PathBuf,
     /// `<data_local>/regent/models`
     pub models_dir: PathBuf,
+    /// `<data_local>/regent/logs`
+    pub log_dir: PathBuf,
     /// `<cache>/regent/kv`
     pub prefix_cache_dir: PathBuf,
 }
@@ -31,6 +33,7 @@ impl AppPaths {
             settings_file: config.join("regent").join("settings.toml"),
             database_file: data_dir.join("regent.db"),
             models_dir: data_dir.join("models"),
+            log_dir: data_dir.join("logs"),
             data_dir,
             prefix_cache_dir: cache.join("regent").join("kv"),
         }
@@ -71,6 +74,10 @@ mod tests {
         assert_eq!(
             paths.models_dir,
             PathBuf::from("/data-local").join("regent").join("models")
+        );
+        assert_eq!(
+            paths.log_dir,
+            PathBuf::from("/data-local").join("regent").join("logs")
         );
         assert_eq!(
             paths.prefix_cache_dir,

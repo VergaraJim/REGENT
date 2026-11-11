@@ -177,6 +177,7 @@ enum Command {
     /// Run one turn.
     Send {
         text: String,
+        from_voice: bool,
         settings: TurnSettings,
         events: Sender<TurnMessage>,
         acks: Receiver<()>,
@@ -341,6 +342,19 @@ impl ChatService {
         settings: &TurnSettings,
         on_event: &mut dyn FnMut(ChatEvent),
     ) -> Result<(), String> {
+        self.send_from(text, false, settings, on_event)
+    }
+
+    /// Runs one chat turn, marking the user message as typed or spoken.
+    ///
+    /// This is [`ChatService::send`] with `from_voice` stored on the user row.
+    pub fn send_from(
+        &self,
+        text: &str,
+        from_voice: bool,
+        settings: &TurnSettings,
+        on_event: &mut dyn FnMut(ChatEvent),
+    ) -> Result<(), String> {
         let (events, incoming) = mpsc::channel();
         // The worker waits for this acknowledgement after every token, so the
         // engine stops as soon as `on_event` cancels the turn.
@@ -351,6 +365,7 @@ impl ChatService {
         self.commands
             .send(Command::Send {
                 text: text.to_string(),
+                from_voice,
                 settings: settings.clone(),
                 events,
                 acks,
@@ -498,11 +513,12 @@ impl Worker {
                 }
                 Command::Send {
                     text,
+                    from_voice,
                     settings,
                     events,
                     acks,
                 } => {
-                    let result = self.send(&text, &settings, &events, &acks);
+                    let result = self.send(&text, from_voice, &settings, &events, &acks);
                     let _ = events.send(TurnMessage::Finished(result));
                     self.idle_work(&commands);
                 }
@@ -960,6 +976,7 @@ impl Worker {
     fn send(
         &mut self,
         text: &str,
+        from_voice: bool,
         settings: &TurnSettings,
         events: &Sender<TurnMessage>,
         acks: &Receiver<()>,
@@ -977,7 +994,7 @@ impl Worker {
         self.cancel.store(false, Ordering::SeqCst);
 
         self.store_mut()?
-            .append(Role::User, text, false)
+            .append(Role::User, text, from_voice)
             .map_err(|error| error.to_string())?;
 
         self.set_status(ChatState::Generating, None);
@@ -1623,6 +1640,24 @@ mod tests {
                 ChatState::Ready
             ]
         );
+    }
+
+    #[test]
+    fn send_from_a_voice_turn_marks_only_the_user_row() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let service = service(&dir, piece_factory(&["Spoken reply"]));
+        service.start(Some(config(&dir)), None).expect("start");
+
+        service
+            .send_from("hi", true, &TurnSettings::default(), &mut |_| {})
+            .expect("send_from should succeed");
+
+        let history = service.history(10).expect("history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].role, Role::User);
+        assert!(history[0].from_voice, "the user row should be a voice turn");
+        assert_eq!(history[1].role, Role::Assistant);
+        assert!(!history[1].from_voice, "the reply is never a voice row");
     }
 
     #[test]

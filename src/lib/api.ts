@@ -297,6 +297,58 @@ export interface MemoryStatus {
 export const MEMORY_STATUS_EVENT = "memory-status";
 
 /* ------------------------------------------------------------------ */
+/* Voice                                                               */
+/* ------------------------------------------------------------------ */
+
+/** Where the speech-to-text engine is in its lifecycle. */
+export type VoiceState = "off" | "loading" | "ready" | "error";
+
+/** The payload of the `voice-status` event and of `get_voice_status`. */
+export interface VoiceStatus {
+  state: VoiceState;
+  /** Whether the microphone is capturing audio. */
+  listening: boolean;
+  /** Whether the mic is paused because Regent is speaking. */
+  paused: boolean;
+  error: string | null;
+}
+
+/** The event the backend emits whenever the voice input changes state. */
+export const VOICE_STATUS_EVENT = "voice-status";
+
+/** The payload of the `mic-level` event; `level` is 0.0 to 1.0. */
+export interface MicLevel {
+  level: number;
+}
+
+/** The event the backend emits with the microphone's current loudness. */
+export const MIC_LEVEL_EVENT = "mic-level";
+
+/** The payload of the `voice-transcript` event. */
+export interface VoiceTranscript {
+  text: string;
+}
+
+/** The event the backend emits for every finished speech transcript. */
+export const VOICE_TRANSCRIPT_EVENT = "voice-transcript";
+
+/** The payload of the `speaking` event. */
+export interface SpeakingPayload {
+  speaking: boolean;
+}
+
+/** The event the backend emits when spoken output starts or stops. */
+export const SPEAKING_EVENT = "speaking";
+
+/** The payload of the `voice-output-error` event. */
+export interface VoiceOutputError {
+  message: string;
+}
+
+/** The event the backend emits when spoken output fails. */
+export const VOICE_OUTPUT_ERROR_EVENT = "voice-output-error";
+
+/* ------------------------------------------------------------------ */
 /* Commands                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -375,14 +427,18 @@ export function getHistory(): Promise<ChatMessage[]> {
 /**
  * Sends `text` and calls `onEvent` for every streamed token and for the final
  * `done`, `cancelled` or `error` event. Resolves when the turn ends.
+ *
+ * Pass `fromVoice` for a turn that came from speech, so the stored user row is
+ * marked as a voice turn.
  */
 export function sendMessage(
   text: string,
   onEvent: (event: ChatEvent) => void,
+  fromVoice = false,
 ): Promise<void> {
   const channel = new Channel<ChatEvent>();
   channel.onmessage = onEvent;
-  return invoke<void>("send_message", { text, onEvent: channel });
+  return invoke<void>("send_message", { text, fromVoice, onEvent: channel });
 }
 
 /** Calls `cb` for every engine state change. Remember to call the unlistener. */
@@ -405,6 +461,70 @@ export function onMemoryStatus(
 ): Promise<UnlistenFn> {
   return listen<MemoryStatus>(MEMORY_STATUS_EVENT, (event) => {
     cb(event.payload);
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* Voice commands                                                      */
+/* ------------------------------------------------------------------ */
+
+/** Reads the speech-to-text engine's current state. */
+export function getVoiceStatus(): Promise<VoiceStatus> {
+  return invoke<VoiceStatus>("get_voice_status");
+}
+
+/** Turns the microphone on or off. Errors reach the UI as a status event. */
+export function setListening(on: boolean): Promise<void> {
+  return invoke<void>("set_listening", { on });
+}
+
+/** Stops any spoken reply that is playing. */
+export function stopSpeaking(): Promise<void> {
+  return invoke<void>("stop_speaking");
+}
+
+/** Calls `cb` for every voice input state change. Remember to call the unlistener. */
+export function onVoiceStatus(
+  cb: (status: VoiceStatus) => void,
+): Promise<UnlistenFn> {
+  return listen<VoiceStatus>(VOICE_STATUS_EVENT, (event) => {
+    cb(event.payload);
+  });
+}
+
+/** Calls `cb` with the microphone's loudness. Remember to call the unlistener. */
+export function onMicLevel(
+  cb: (level: number) => void,
+): Promise<UnlistenFn> {
+  return listen<MicLevel>(MIC_LEVEL_EVENT, (event) => {
+    cb(event.payload.level);
+  });
+}
+
+/** Calls `cb` for every speech transcript. Remember to call the unlistener. */
+export function onVoiceTranscript(
+  cb: (text: string) => void,
+): Promise<UnlistenFn> {
+  return listen<VoiceTranscript>(VOICE_TRANSCRIPT_EVENT, (event) => {
+    cb(event.payload.text);
+  });
+}
+
+/** Calls `cb` when spoken output starts or stops. Remember to call the unlistener. */
+export function onSpeaking(
+  cb: (speaking: boolean) => void,
+): Promise<UnlistenFn> {
+  return listen<SpeakingPayload>(SPEAKING_EVENT, (event) => {
+    cb(event.payload.speaking);
+  });
+}
+
+/** Calls `cb` when spoken output fails. Remember to call the unlistener. */
+export function onVoiceOutputError(
+  cb: (message: string) => void,
+): Promise<UnlistenFn> {
+  return listen<VoiceOutputError>(VOICE_OUTPUT_ERROR_EVENT, (event) => {
+    cb(event.payload.message);
   });
 }
 
