@@ -22,5 +22,7 @@ pub use message::{ChatMessage, Role};
 pub use prompt::{
     build_prompt, system_text, PromptMessage, PromptRole, REPLY_RESERVE_TOKENS, SYSTEM_PROMPT,
 };
-pub use service::{ChatEvent, ChatService, ChatState, ChatStatus, EngineFactory, StatusSink};
+pub use service::{
+    ChatEvent, ChatService, ChatState, ChatStatus, EngineFactory, StatusSink, TurnSettings,
+};
 pub use store::{ChatStore, ChatStoreError, Summary, HISTORY_READ_CAP};

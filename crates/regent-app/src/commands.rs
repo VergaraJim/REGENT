@@ -6,7 +6,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use regent_core::chat::{ChatEvent, ChatMessage, ChatStatus, EngineConfig, HISTORY_READ_CAP};
+use regent_core::chat::{
+    ChatEvent, ChatMessage, ChatStatus, EngineConfig, TurnSettings, HISTORY_READ_CAP,
+};
 use regent_core::estimate::SlotId;
 use regent_core::settings::{SaveError, Settings, SettingsStore};
 use serde::Serialize;
@@ -230,13 +232,20 @@ pub async fn send_message(
     text: String,
     on_event: Channel<ChatEvent>,
 ) -> Result<(), CommandError> {
-    let system_addition = app.state::<AppState>().settings().system_prompt_addition;
+    let settings = {
+        let state = app.state::<AppState>();
+        let settings = state.settings();
+        TurnSettings {
+            system_addition: settings.system_prompt_addition.clone(),
+            compaction: settings.compaction.clone(),
+        }
+    };
     let handle = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         handle
             .state::<AppState>()
             .chat
-            .send(&text, &system_addition, &mut |event| {
+            .send(&text, &settings, &mut |event| {
                 let _ = on_event.send(event);
             })
     })

@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
@@ -28,6 +29,10 @@ pub struct EngineConfig {
 pub struct GenerationStats {
     /// Tokens the prompt took.
     pub prompt_tokens: usize,
+    /// Prompt tokens served from the engine's prefix cache.
+    pub reused_tokens: usize,
+    /// Prompt tokens the engine had to process itself.
+    pub processed_tokens: usize,
     /// Tokens the reply took.
     pub generated_tokens: usize,
     /// Decoding speed, in tokens per second.
@@ -71,6 +76,23 @@ pub trait ChatEngine: Send {
         cancel: &AtomicBool,
         on_token: &mut dyn FnMut(&str),
     ) -> Result<Outcome, ChatEngineError>;
+
+    /// Writes a summary of `prompt`, using at most `max_tokens` for the reply.
+    ///
+    /// `Ok(None)` means the pass was cancelled; an error means the engine could
+    /// not write a summary at all. Compaction treats both as "no summary this
+    /// time" and leaves the prompt builder's fallback trimming to cope.
+    fn summarize(
+        &mut self,
+        prompt: &[PromptMessage],
+        max_tokens: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Option<String>, ChatEngineError> {
+        let _ = (prompt, max_tokens, cancel);
+        Err(ChatEngineError(
+            "This engine can't write summaries.".to_string(),
+        ))
+    }
 }
 
 /// A deterministic engine that emits fixed pieces.
@@ -81,6 +103,8 @@ pub struct FakeEngine {
     pieces: Vec<String>,
     context_tokens: usize,
     fail: Option<String>,
+    summaries: Vec<String>,
+    prompts: Option<Arc<Mutex<Vec<Vec<PromptMessage>>>>>,
 }
 
 impl FakeEngine {
@@ -91,6 +115,8 @@ impl FakeEngine {
             pieces,
             context_tokens,
             fail: None,
+            summaries: Vec::new(),
+            prompts: None,
         }
     }
 
@@ -100,6 +126,31 @@ impl FakeEngine {
             pieces: Vec::new(),
             context_tokens: 4096,
             fail: Some(message.into()),
+            summaries: Vec::new(),
+            prompts: None,
+        }
+    }
+
+    /// The summaries this engine hands out, one per [`ChatEngine::summarize`]
+    /// call, in order.
+    pub fn with_summaries(mut self, summaries: Vec<String>) -> Self {
+        self.summaries = summaries;
+        self
+    }
+
+    /// Records every prompt passed to [`ChatEngine::generate`] or
+    /// [`ChatEngine::summarize`] into `log`, oldest first.
+    pub fn with_prompt_log(mut self, log: Arc<Mutex<Vec<Vec<PromptMessage>>>>) -> Self {
+        self.prompts = Some(log);
+        self
+    }
+
+    /// Records `prompt` when a prompt log is attached.
+    fn record(&self, prompt: &[PromptMessage]) {
+        if let Some(log) = &self.prompts {
+            log.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(prompt.to_vec());
         }
     }
 }
@@ -123,6 +174,8 @@ impl ChatEngine for FakeEngine {
             return Err(ChatEngineError(message.clone()));
         }
 
+        self.record(prompt);
+
         let mut generated = String::new();
         for piece in &self.pieces {
             if cancel.load(Ordering::SeqCst) {
@@ -133,15 +186,37 @@ impl ChatEngine for FakeEngine {
         }
         Ok(Outcome::Finished(stats_for(prompt, &generated)))
     }
+
+    fn summarize(
+        &mut self,
+        prompt: &[PromptMessage],
+        _max_tokens: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Option<String>, ChatEngineError> {
+        self.record(prompt);
+        if cancel.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        if self.summaries.is_empty() {
+            return Err(ChatEngineError(
+                "This engine has no summary to give.".to_string(),
+            ));
+        }
+        Ok(Some(self.summaries.remove(0)))
+    }
 }
 
 /// The stats for a reply, counted the same way as [`FakeEngine::count_tokens`].
 fn stats_for(prompt: &[PromptMessage], generated: &str) -> GenerationStats {
+    let prompt_tokens: usize = prompt
+        .iter()
+        .map(|message| message.text.split_whitespace().count())
+        .sum();
     GenerationStats {
-        prompt_tokens: prompt
-            .iter()
-            .map(|message| message.text.split_whitespace().count())
-            .sum(),
+        prompt_tokens,
+        // The fake engine has no prefix cache.
+        reused_tokens: 0,
+        processed_tokens: prompt_tokens,
         generated_tokens: generated.split_whitespace().count(),
         // The fake engine has no timing to report; the real engine fills this.
         tokens_per_second: 0.0,

@@ -251,6 +251,10 @@ impl ChatEngine for LlamaChatEngine {
         };
         let stats = GenerationStats {
             prompt_tokens: prompt_len,
+            // No prefix cache is reused in this stage: the whole prompt is
+            // decoded again on every turn.
+            reused_tokens: 0,
+            processed_tokens: prompt_len,
             generated_tokens,
             tokens_per_second,
         };
