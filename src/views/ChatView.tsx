@@ -4,7 +4,7 @@ import { Alert, Button, Spinner } from "@heroui/react";
 import { Composer } from "../components/chat/Composer.tsx";
 import { MessageBubble } from "../components/chat/MessageBubble.tsx";
 import type { ChatController } from "../hooks/useChat.ts";
-import type { MemoryStatus } from "../lib/api.ts";
+import type { MemoryStatus, VisionStatus } from "../lib/api.ts";
 import { toDisplayMessages } from "../lib/chatDisplay.ts";
 
 export interface ChatViewProps {
@@ -14,6 +14,8 @@ export interface ChatViewProps {
   onOpenSettings: () => void;
   /** The memory index's state, shown as a muted line under the composer. */
   memory?: MemoryStatus | null;
+  /** The vision engine's state, shown just above the memory line. */
+  vision?: VisionStatus | null;
   /** A voice failure to show in red just above the memory line. */
   voiceNotice?: string | null;
 }
@@ -24,6 +26,7 @@ export function ChatView({
   textModelSet,
   onOpenSettings,
   memory = null,
+  vision = null,
   voiceNotice = null,
 }: ChatViewProps) {
   const {
@@ -151,6 +154,23 @@ export function ChatView({
             className="truncate text-xs text-danger"
           >
             {voiceNotice}
+          </p>
+        ) : null}
+        {vision?.state === "loading" ? (
+          <div
+            role="status"
+            className="flex items-center gap-2 text-xs text-muted"
+          >
+            <Spinner size="sm" />
+            <span>Loading vision model…</span>
+          </div>
+        ) : vision?.error ? (
+          <p
+            role="alert"
+            title={vision.error}
+            className="truncate text-xs text-danger"
+          >
+            {vision.error}
           </p>
         ) : null}
         {memoryLine ? (

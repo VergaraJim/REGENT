@@ -2,7 +2,12 @@ import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import { ChatView } from "./ChatView.tsx";
 import type { ChatController } from "../hooks/useChat.ts";
-import type { ChatMessage, ChatState, MemoryStatus } from "../lib/api.ts";
+import type {
+  ChatMessage,
+  ChatState,
+  MemoryStatus,
+  VisionStatus,
+} from "../lib/api.ts";
 
 function controller(
   chatState: ChatState,
@@ -29,6 +34,7 @@ function render(
   textModelSet = true,
   memory: MemoryStatus | null = null,
   voiceNotice: string | null = null,
+  vision: VisionStatus | null = null,
 ): string {
   return renderToStaticMarkup(
     <ChatView
@@ -37,6 +43,7 @@ function render(
       onOpenSettings={() => {}}
       memory={memory}
       voiceNotice={voiceNotice}
+      vision={vision}
     />,
   );
 }
@@ -251,5 +258,80 @@ describe("ChatView markup", () => {
     });
     expect(html).toContain("The embedding model could not load.");
     expect(html).toContain("truncate");
+  });
+
+  it("shows the vision loading line with a spinner", () => {
+    const html = render(
+      controller("ready", { messages }),
+      true,
+      null,
+      null,
+      { state: "loading", error: null },
+    );
+    expect(html).toContain("Loading vision model…");
+    expect(html).toContain('role="status"');
+    // Same muted row as the "Compacting…" hint.
+    expect(html).toContain("flex items-center gap-2 text-xs text-muted");
+  });
+
+  it("shows a vision error as one truncated line with the full text on hover", () => {
+    const message = "The vision projector could not be loaded.";
+    const html = render(
+      controller("ready", { messages }),
+      true,
+      null,
+      null,
+      { state: "idle", error: message },
+    );
+    expect(html).toContain(message);
+    expect(html).toContain('role="alert"');
+    expect(html).toContain(`title="${message}"`);
+    expect(html).toContain("truncate text-xs text-danger");
+  });
+
+  it("prefers the vision loading line when both are set", () => {
+    const html = render(
+      controller("ready", { messages }),
+      true,
+      null,
+      null,
+      { state: "loading", error: "The vision projector could not be loaded." },
+    );
+    expect(html).toContain("Loading vision model…");
+    expect(html).not.toContain("The vision projector could not be loaded.");
+  });
+
+  it("renders no vision line when idle, ready, off or unknown", () => {
+    for (const vision of [
+      null,
+      { state: "off", error: null },
+      { state: "idle", error: null },
+      { state: "ready", error: null },
+    ] satisfies (VisionStatus | null)[]) {
+      const html = render(
+        controller("ready", { messages }),
+        true,
+        null,
+        null,
+        vision,
+      );
+      expect(html).not.toContain("Loading vision model…");
+      expect(html).not.toContain("text-danger");
+    }
+  });
+
+  it("puts the vision line above the memory line and below the composer", () => {
+    const html = render(
+      controller("ready", { messages }),
+      true,
+      { state: "ready", indexed: 3, total: 5, error: null },
+      null,
+      { state: "loading", error: null },
+    );
+    const composer = html.indexOf('aria-label="Message"');
+    const vision = html.indexOf("Loading vision model…");
+    const memory = html.indexOf("Memory: 3 of 5 messages saved");
+    expect(vision).toBeGreaterThan(composer);
+    expect(vision).toBeLessThan(memory);
   });
 });
