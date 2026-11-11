@@ -7,6 +7,7 @@
 
 use super::message::{ChatMessage, Role};
 use super::prompt::{system_text_with_summary, PromptMessage, PromptRole};
+use super::tools::{call_block, TOOL_RESULT_HEADING};
 
 /// The per-message template overhead in tokens.
 ///
@@ -68,7 +69,16 @@ pub fn working_memory_tokens(
     let system = system_text_with_summary(system_text, summary);
     let mut total = count_tokens(&system) + MESSAGE_TEMPLATE_COST;
     for message in messages {
-        total += count_tokens(&message.text) + MESSAGE_TEMPLATE_COST;
+        if message.role == Role::Tool {
+            // A tool row replays a call block on the assistant turn and then
+            // appears as a heading plus result, matching `build_prompt`.
+            let block = call_block(message.tool_call.as_deref());
+            total += count_tokens(&block) + MESSAGE_TEMPLATE_COST;
+            total += count_tokens(&format!("{TOOL_RESULT_HEADING}\n{}", message.text))
+                + MESSAGE_TEMPLATE_COST;
+        } else {
+            total += count_tokens(&message.text) + MESSAGE_TEMPLATE_COST;
+        }
     }
     total
 }

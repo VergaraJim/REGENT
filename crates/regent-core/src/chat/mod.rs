@@ -11,6 +11,7 @@ pub mod prefix_cache;
 pub mod prompt;
 pub mod service;
 pub mod store;
+pub mod tools;
 
 pub use compaction::{
     accept_summary, build_summary_prompt, plan_compaction, summarizer_budget, summary_cap,
@@ -22,9 +23,15 @@ pub use engine::{ChatEngine, ChatEngineError, EngineConfig, FakeEngine, Generati
 pub use message::{ChatMessage, Role};
 pub use prefix_cache::{CacheIdentity, PrefixCache, PrefixKey};
 pub use prompt::{
-    build_prompt, system_text, PromptMessage, PromptRole, REPLY_RESERVE_TOKENS, SYSTEM_PROMPT,
+    build_prompt, fixed_prefix, system_text, PromptMessage, PromptRole, REPLY_RESERVE_TOKENS,
+    SYSTEM_PROMPT,
 };
 pub use service::{
     ChatEvent, ChatService, ChatState, ChatStatus, EngineFactory, StatusSink, TurnSettings,
 };
 pub use store::{ChatStore, ChatStoreError, Summary, HISTORY_READ_CAP};
+pub use tools::{
+    search_memory_spec, tools_section, validate_call, ParamKind, ParamSpec, ParsedPiece,
+    ToolCallParser, ToolSpec, ValidCall, ANSWER_NOW, MAX_TOOL_CALLS_PER_TURN, TOOL_CALL_CLOSE,
+    TOOL_CALL_OPEN, TOOL_RESULT_HEADING,
+};

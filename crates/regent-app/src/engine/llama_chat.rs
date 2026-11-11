@@ -543,6 +543,9 @@ fn role_name(role: PromptRole) -> &'static str {
         PromptRole::System => "system",
         PromptRole::User => "user",
         PromptRole::Assistant => "assistant",
+        // Most chat templates only accept user and assistant turns, so a tool
+        // result is replayed as a user message.
+        PromptRole::Tool => "user",
     }
 }
 

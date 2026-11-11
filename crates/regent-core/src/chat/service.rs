@@ -635,6 +635,7 @@ impl Worker {
         };
         let prompt = build_prompt(
             &settings.system_addition,
+            "",
             summary.as_deref(),
             &messages,
             context_tokens,
