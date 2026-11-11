@@ -28,6 +28,7 @@ function render(
   chat: ChatController,
   textModelSet = true,
   memory: MemoryStatus | null = null,
+  voiceNotice: string | null = null,
 ): string {
   return renderToStaticMarkup(
     <ChatView
@@ -35,6 +36,7 @@ function render(
       textModelSet={textModelSet}
       onOpenSettings={() => {}}
       memory={memory}
+      voiceNotice={voiceNotice}
     />,
   );
 }
@@ -217,6 +219,27 @@ describe("ChatView markup", () => {
       error: null,
     });
     expect(off).not.toContain("Memory");
+  });
+
+  it("shows a voice notice above the memory line", () => {
+    const html = render(
+      controller("ready", { messages }),
+      true,
+      { state: "ready", indexed: 3, total: 5, error: null },
+      "The speaker could not be loaded.",
+    );
+    expect(html).toContain("The speaker could not be loaded.");
+    expect(html).toContain("text-danger");
+
+    const notice = html.indexOf("The speaker could not be loaded.");
+    const memory = html.indexOf("Memory: 3 of 5 messages saved");
+    expect(notice).toBeGreaterThanOrEqual(0);
+    expect(memory).toBeGreaterThan(notice);
+  });
+
+  it("renders no voice notice when there is none", () => {
+    const html = render(controller("ready", { messages }), true, null, null);
+    expect(html).not.toContain("text-danger");
   });
 
   it("shows a memory error while off", () => {

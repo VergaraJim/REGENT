@@ -14,6 +14,8 @@ export interface ChatViewProps {
   onOpenSettings: () => void;
   /** The memory index's state, shown as a muted line under the composer. */
   memory?: MemoryStatus | null;
+  /** A voice failure to show in red just above the memory line. */
+  voiceNotice?: string | null;
 }
 
 /** The conversation, its states, and the composer pinned to the bottom. */
@@ -22,6 +24,7 @@ export function ChatView({
   textModelSet,
   onOpenSettings,
   memory = null,
+  voiceNotice = null,
 }: ChatViewProps) {
   const {
     messages,
@@ -140,6 +143,16 @@ export function ChatView({
           onSend={controller.send}
           onCancel={controller.cancel}
         />
+        {voiceNotice ? (
+          <p
+            role="status"
+            aria-live="polite"
+            title={voiceNotice}
+            className="truncate text-xs text-danger"
+          >
+            {voiceNotice}
+          </p>
+        ) : null}
         {memoryLine ? (
           <p
             role="status"

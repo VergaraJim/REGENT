@@ -31,7 +31,7 @@ export interface ChatController {
   /** Unloads the engine; the conversation stays on screen. */
   stop: () => void;
   /** Streams one reply to `text`. Does nothing unless the engine is ready. */
-  send: (text: string) => void;
+  send: (text: string, fromVoice?: boolean) => void;
   /** Asks the engine to stop generating, keeping any partial reply. */
   cancel: () => void;
 }
@@ -160,7 +160,7 @@ export function useChat(): ChatController {
   );
 
   const send = useCallback(
-    (raw: string) => {
+    (raw: string, fromVoice = false) => {
       const text = raw.trim();
       if (
         !text ||
@@ -175,7 +175,7 @@ export function useChat(): ChatController {
           id: nextLocalId.current--,
           role: "user",
           text,
-          from_voice: false,
+          from_voice: fromVoice,
           created_at: Date.now(),
         },
       ]);
@@ -187,40 +187,44 @@ export function useChat(): ChatController {
       setTurnError(null);
       applyState("generating");
 
-      sendMessage(text, (event) => {
-        if (!alive.current) return;
-        switch (event.type) {
-          case "compacting":
-            setCompactingReply(true);
-            break;
-          case "token":
-            setCompactingReply(false);
-            streaming.current = (streaming.current ?? "") + event.text;
-            setStreamingText(streaming.current);
-            break;
-          case "tool": {
-            turnUsedTool.current = true;
-            const label = toolLabel(event.name);
-            setStreamingTools((previous) =>
-              previous.includes(label) ? previous : [...previous, label],
-            );
-            break;
+      sendMessage(
+        text,
+        (event) => {
+          if (!alive.current) return;
+          switch (event.type) {
+            case "compacting":
+              setCompactingReply(true);
+              break;
+            case "token":
+              setCompactingReply(false);
+              streaming.current = (streaming.current ?? "") + event.text;
+              setStreamingText(streaming.current);
+              break;
+            case "tool": {
+              turnUsedTool.current = true;
+              const label = toolLabel(event.name);
+              setStreamingTools((previous) =>
+                previous.includes(label) ? previous : [...previous, label],
+              );
+              break;
+            }
+            case "done":
+            case "cancelled":
+              finishStream(event.message_id);
+              break;
+            case "error":
+              streaming.current = null;
+              turnUsedTool.current = false;
+              setStreamingText(null);
+              setStreamingTools([]);
+              setCompactingReply(false);
+              setTurnError(event.message);
+              applyState("ready");
+              break;
           }
-          case "done":
-          case "cancelled":
-            finishStream(event.message_id);
-            break;
-          case "error":
-            streaming.current = null;
-            turnUsedTool.current = false;
-            setStreamingText(null);
-            setStreamingTools([]);
-            setCompactingReply(false);
-            setTurnError(event.message);
-            applyState("ready");
-            break;
-        }
-      }).catch((failure: unknown) => {
+        },
+        fromVoice,
+      ).catch((failure: unknown) => {
         if (!alive.current) return;
         streaming.current = null;
         turnUsedTool.current = false;
