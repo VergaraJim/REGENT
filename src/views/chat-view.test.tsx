@@ -12,6 +12,7 @@ function controller(
     messages: [],
     chatState,
     error: null,
+    turnError: null,
     streamingText: null,
     start: () => {},
     stop: () => {},
@@ -78,6 +79,23 @@ describe("ChatView markup", () => {
     expect(html).toContain("Sent by voice");
     expect(html).toContain("The model ran out of memory.");
     expect(html).toContain('aria-label="Send"');
+  });
+
+  it("shows a turn error without a Start button", () => {
+    const html = render(
+      controller("ready", {
+        messages,
+        turnError: "The model ran out of memory.",
+      }),
+    );
+    expect(html).toContain("The model ran out of memory.");
+    expect(html).not.toContain("Start");
+  });
+
+  it("tells the user how to continue when stopped with a conversation", () => {
+    const html = render(controller("stopped", { messages }));
+    expect(html).toContain("Regent is stopped. Press Start to continue.");
+    expect(html).toContain("Hello there");
   });
 
   it("turns Send into Cancel while generating", () => {

@@ -18,7 +18,7 @@ export function ChatView({
   textModelSet,
   onOpenSettings,
 }: ChatViewProps) {
-  const { messages, chatState, error, streamingText } = controller;
+  const { messages, chatState, error, turnError, streamingText } = controller;
   const listRef = useRef<HTMLDivElement>(null);
   const nearBottom = useRef(true);
 
@@ -83,6 +83,21 @@ export function ChatView({
               </div>
             </Alert.Content>
           </Alert>
+        ) : null}
+        {turnError ? (
+          <Alert status="danger" className="text-sm">
+            <Alert.Indicator />
+            <Alert.Content>
+              <Alert.Description className="break-words">
+                {turnError}
+              </Alert.Description>
+            </Alert.Content>
+          </Alert>
+        ) : null}
+        {chatState === "stopped" && messages.length > 0 ? (
+          <p className="text-xs text-muted">
+            Regent is stopped. Press Start to continue.
+          </p>
         ) : null}
         <Composer
           disabled={chatState !== "ready"}

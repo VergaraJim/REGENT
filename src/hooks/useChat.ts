@@ -15,13 +15,15 @@ export interface ChatController {
   /** The stored conversation, oldest first. */
   messages: ChatMessage[];
   chatState: ChatState;
-  /** The last setup or generation failure, if any. */
+  /** The last start-up or engine-state failure, if any. */
   error: string | null;
+  /** The last chat turn's failure, shown until the next send, Start or Stop. */
+  turnError: string | null;
   /** Text of the assistant reply still streaming in, or `null` when idle. */
   streamingText: string | null;
   /** Loads the model and gets the engine ready. */
   start: () => void;
-  /** Unloads the engine and returns to the empty conversation. */
+  /** Unloads the engine; the conversation stays on screen. */
   stop: () => void;
   /** Streams one reply to `text`. Does nothing unless the engine is ready. */
   send: (text: string) => void;
@@ -40,6 +42,7 @@ export function useChat(): ChatController {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatState, setChatState] = useState<ChatState>("stopped");
   const [error, setError] = useState<string | null>(null);
+  const [turnError, setTurnError] = useState<string | null>(null);
   const [streamingText, setStreamingText] = useState<string | null>(null);
 
   const alive = useRef(true);
@@ -134,6 +137,7 @@ export function useChat(): ChatController {
       streaming.current = "";
       setStreamingText("");
       setError(null);
+      setTurnError(null);
       applyState("generating");
 
       sendMessage(text, (event) => {
@@ -150,16 +154,16 @@ export function useChat(): ChatController {
           case "error":
             streaming.current = null;
             setStreamingText(null);
-            setError(event.message);
-            applyState("error");
+            setTurnError(event.message);
+            applyState("ready");
             break;
         }
       }).catch((failure: unknown) => {
         if (!alive.current) return;
         streaming.current = null;
         setStreamingText(null);
-        setError(errorMessage(failure));
-        applyState("error");
+        setTurnError(errorMessage(failure));
+        applyState("ready");
       });
     },
     [applyState, finishStream],
@@ -167,6 +171,7 @@ export function useChat(): ChatController {
 
   const start = useCallback(() => {
     setError(null);
+    setTurnError(null);
     applyState("loading");
     startChat()
       .then(() => getChatState())
@@ -188,8 +193,8 @@ export function useChat(): ChatController {
         if (!alive.current) return;
         streaming.current = null;
         setStreamingText(null);
-        setMessages([]);
         setError(null);
+        setTurnError(null);
         applyState("stopped");
       })
       .catch((failure: unknown) => {
@@ -210,6 +215,7 @@ export function useChat(): ChatController {
     messages,
     chatState,
     error,
+    turnError,
     streamingText,
     start,
     stop,

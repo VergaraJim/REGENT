@@ -165,8 +165,48 @@ describe("useChat", () => {
     await emit({ type: "error", message: "The model ran out of memory." });
 
     expect(chat.current().streamingText).toBeNull();
-    expect(chat.current().error).toBe("The model ran out of memory.");
-    expect(chat.current().chatState).toBe("error");
+    expect(chat.current().turnError).toBe("The model ran out of memory.");
+    expect(chat.current().error).toBeNull();
+    expect(chat.current().chatState).toBe("ready");
+    chat.unmount();
+  });
+
+  it("clears a turn error on the next send", async () => {
+    const chat = await mount({ state: "ready", error: null });
+
+    await act(async () => {
+      chat.current().send("Hello");
+    });
+    await emit({ type: "error", message: "The model ran out of memory." });
+    expect(chat.current().turnError).toBe("The model ran out of memory.");
+
+    await act(async () => {
+      chat.current().send("Again");
+    });
+    expect(chat.current().turnError).toBeNull();
+    expect(api.sendMessage).toHaveBeenCalledTimes(2);
+    chat.unmount();
+  });
+
+  it("keeps the conversation when the engine is stopped", async () => {
+    const chat = await mount({ state: "ready", error: null }, [
+      {
+        id: 1,
+        role: "user",
+        text: "Earlier",
+        from_voice: false,
+        created_at: 1,
+      },
+    ]);
+    expect(chat.current().messages).toHaveLength(1);
+
+    await act(async () => {
+      chat.current().stop();
+    });
+
+    expect(api.stopChat).toHaveBeenCalledTimes(1);
+    expect(chat.current().messages).toHaveLength(1);
+    expect(chat.current().chatState).toBe("stopped");
     chat.unmount();
   });
 
