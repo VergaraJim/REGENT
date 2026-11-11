@@ -111,6 +111,7 @@ pub fn build_summary_prompt(
             let speaker = match message.role {
                 Role::User => "User",
                 Role::Assistant => "Regent",
+                Role::Tool => "Tool",
             };
             format!("{speaker}: {}", message.text)
         })
@@ -220,6 +221,8 @@ mod tests {
             text: text.to_string(),
             from_voice: false,
             created_at: 0,
+            tool_name: None,
+            tool_call: None,
         }
     }
 

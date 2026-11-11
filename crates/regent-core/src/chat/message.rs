@@ -10,6 +10,8 @@ pub enum Role {
     User,
     /// Regent's reply.
     Assistant,
+    /// The result of a tool call Regent made.
+    Tool,
 }
 
 impl Role {
@@ -18,6 +20,7 @@ impl Role {
         match self {
             Role::User => "user",
             Role::Assistant => "assistant",
+            Role::Tool => "tool",
         }
     }
 
@@ -26,6 +29,7 @@ impl Role {
         match text {
             "user" => Some(Role::User),
             "assistant" => Some(Role::Assistant),
+            "tool" => Some(Role::Tool),
             _ => None,
         }
     }
@@ -44,6 +48,12 @@ pub struct ChatMessage {
     pub from_voice: bool,
     /// When it was stored, in unix seconds.
     pub created_at: i64,
+    /// The tool that produced this row; only set on `tool` rows.
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    /// The raw JSON of the call, as the model wrote it; only set on `tool` rows.
+    #[serde(default)]
+    pub tool_call: Option<String>,
 }
 
 #[cfg(test)]
@@ -52,7 +62,7 @@ mod tests {
 
     #[test]
     fn role_round_trips_through_storage_strings() {
-        for role in [Role::User, Role::Assistant] {
+        for role in [Role::User, Role::Assistant, Role::Tool] {
             assert_eq!(Role::from_storage(role.as_str()), Some(role));
         }
         assert_eq!(Role::from_storage("system"), None);

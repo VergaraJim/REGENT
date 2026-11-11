@@ -99,6 +99,8 @@ pub fn build_prompt(
             role: match message.role {
                 Role::User => PromptRole::User,
                 Role::Assistant => PromptRole::Assistant,
+                // Tool rows get their own replay format in the tool-call task.
+                Role::Tool => PromptRole::User,
             },
             text: message.text.clone(),
         })
@@ -138,6 +140,8 @@ mod tests {
             text: text.to_string(),
             from_voice: false,
             created_at: 0,
+            tool_name: None,
+            tool_call: None,
         }
     }
 
