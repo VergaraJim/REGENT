@@ -14,4 +14,4 @@ pub use engine::{ChatEngine, ChatEngineError, EngineConfig, FakeEngine, Generati
 pub use message::{ChatMessage, Role};
 pub use prompt::{build_prompt, PromptMessage, PromptRole, REPLY_RESERVE_TOKENS, SYSTEM_PROMPT};
 pub use service::{ChatEvent, ChatService, ChatState, ChatStatus, EngineFactory, StatusSink};
-pub use store::{ChatStore, ChatStoreError, HISTORY_READ_CAP};
+pub use store::{ChatStore, ChatStoreError, Summary, HISTORY_READ_CAP};
