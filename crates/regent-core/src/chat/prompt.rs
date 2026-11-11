@@ -4,6 +4,7 @@
 //! message is byte-identical on every call, so the model's prefix cache can be
 //! reused across turns.
 
+use super::compaction::{MESSAGE_TEMPLATE_COST, SUMMARY_HEADING};
 use super::message::{ChatMessage, Role};
 
 /// Tokens kept out of the prompt budget and reserved for one reply.
@@ -37,32 +38,59 @@ pub struct PromptMessage {
     pub text: String,
 }
 
+/// The fixed prefix of every prompt: [`SYSTEM_PROMPT`] plus the trimmed
+/// `system_addition` when it is not empty.
+///
+/// The result depends only on the addition, so it is byte-identical across
+/// turns and the model's prefix cache stays valid.
+pub fn system_text(system_addition: &str) -> String {
+    let mut text = String::from(SYSTEM_PROMPT);
+    let addition = system_addition.trim();
+    if !addition.is_empty() {
+        text.push_str("\n\n");
+        text.push_str(addition);
+    }
+    text
+}
+
+/// The system message text: `system_text` with the rolling summary appended
+/// when there is one.
+///
+/// Shared with the compaction planner so both agree on exactly what would be
+/// sent.
+pub(crate) fn system_text_with_summary(system_text: &str, summary: Option<&str>) -> String {
+    let mut text = system_text.to_string();
+    if let Some(summary) = summary {
+        let summary = summary.trim();
+        if !summary.is_empty() {
+            text.push_str("\n\n");
+            text.push_str(SUMMARY_HEADING);
+            text.push('\n');
+            text.push_str(summary);
+        }
+    }
+    text
+}
+
 /// Builds the prompt for a turn.
 ///
-/// The first message is the system prompt plus the trimmed
-/// `system_addition` (when it is not empty). It is followed by `history` in
-/// order. While the total token count exceeds
+/// The first message is [`system_text`] for `system_addition`, plus the
+/// trimmed `summary` under [`SUMMARY_HEADING`] when there is one. It is
+/// followed by `history` in order. While the total token count (each message
+/// plus [`MESSAGE_TEMPLATE_COST`]) exceeds
 /// `context_tokens - REPLY_RESERVE_TOKENS`, the oldest history message is
 /// dropped, but the newest history message and the system message are always
 /// kept.
-///
-/// Real compaction arrives in a later stage; this function only trims.
 pub fn build_prompt(
     system_addition: &str,
+    summary: Option<&str>,
     history: &[ChatMessage],
     context_tokens: usize,
     count_tokens: &dyn Fn(&str) -> usize,
 ) -> Vec<PromptMessage> {
-    let mut system = String::from(SYSTEM_PROMPT);
-    let addition = system_addition.trim();
-    if !addition.is_empty() {
-        system.push_str("\n\n");
-        system.push_str(addition);
-    }
-
     let system_message = PromptMessage {
         role: PromptRole::System,
-        text: system,
+        text: system_text_with_summary(&system_text(system_addition), summary),
     };
 
     let mut kept: Vec<PromptMessage> = history
@@ -79,11 +107,17 @@ pub fn build_prompt(
     let budget = context_tokens.saturating_sub(REPLY_RESERVE_TOKENS);
     while kept.len() > 1 {
         let total = count_tokens(&system_message.text)
-            + kept.iter().map(|m| count_tokens(&m.text)).sum::<usize>();
+            + MESSAGE_TEMPLATE_COST
+            + kept
+                .iter()
+                .map(|m| count_tokens(&m.text) + MESSAGE_TEMPLATE_COST)
+                .sum::<usize>();
         if total <= budget {
             break;
         }
-        // TODO(stage 4): replace dropping with compaction.
+        // Fallback only: compaction normally keeps the prompt under the
+        // trigger; this drops the oldest turns from the prompt, never from
+        // history.
         kept.remove(0);
     }
 
@@ -113,7 +147,7 @@ mod tests {
 
     #[test]
     fn the_prompt_starts_with_the_system_message() {
-        let prompt = build_prompt("", &[], 4096, &word_count);
+        let prompt = build_prompt("", None, &[], 4096, &word_count);
         assert_eq!(prompt.len(), 1);
         assert_eq!(prompt[0].role, PromptRole::System);
         assert_eq!(prompt[0].text, SYSTEM_PROMPT);
@@ -121,18 +155,18 @@ mod tests {
 
     #[test]
     fn the_addition_is_appended_to_the_system_message() {
-        let prompt = build_prompt("  Be terse.  ", &[], 4096, &word_count);
+        let prompt = build_prompt("  Be terse.  ", None, &[], 4096, &word_count);
         assert_eq!(prompt[0].text, format!("{SYSTEM_PROMPT}\n\nBe terse."));
 
         // Blank additions add nothing.
-        let plain = build_prompt("   \n ", &[], 4096, &word_count);
+        let plain = build_prompt("   \n ", None, &[], 4096, &word_count);
         assert_eq!(plain[0].text, SYSTEM_PROMPT);
     }
 
     #[test]
     fn the_system_text_is_identical_across_calls() {
-        let first = build_prompt("Same addition", &[], 4096, &word_count);
-        let second = build_prompt("Same addition", &[], 4096, &word_count);
+        let first = build_prompt("Same addition", None, &[], 4096, &word_count);
+        let second = build_prompt("Same addition", None, &[], 4096, &word_count);
         assert_eq!(first[0].text.as_bytes(), second[0].text.as_bytes());
     }
 
@@ -142,7 +176,7 @@ mod tests {
             message(1, Role::User, "hello"),
             message(2, Role::Assistant, "hi"),
         ];
-        let prompt = build_prompt("", &history, 4096, &word_count);
+        let prompt = build_prompt("", None, &history, 4096, &word_count);
         assert_eq!(prompt.len(), 3);
         assert_eq!(prompt[1].role, PromptRole::User);
         assert_eq!(prompt[1].text, "hello");
@@ -159,7 +193,7 @@ mod tests {
         ];
         // Every word counts as one token. The budget is tiny, so only the
         // newest history message can survive beside the system message.
-        let prompt = build_prompt("", &history, REPLY_RESERVE_TOKENS + 20, &word_count);
+        let prompt = build_prompt("", None, &history, REPLY_RESERVE_TOKENS + 20, &word_count);
         assert_eq!(prompt.len(), 2);
         assert_eq!(prompt[0].role, PromptRole::System);
         assert_eq!(prompt[1].role, PromptRole::User);
@@ -169,8 +203,43 @@ mod tests {
     #[test]
     fn a_single_history_message_is_never_dropped() {
         let history = vec![message(1, Role::User, "this one is far too long to fit")];
-        let prompt = build_prompt("", &history, 0, &word_count);
+        let prompt = build_prompt("", None, &history, 0, &word_count);
         assert_eq!(prompt.len(), 2);
         assert_eq!(prompt[1].text, "this one is far too long to fit");
+    }
+
+    #[test]
+    fn the_summary_is_appended_to_the_system_message() {
+        let prompt = build_prompt(
+            "Be terse.",
+            Some("  talked about rust  "),
+            &[],
+            4096,
+            &word_count,
+        );
+        assert_eq!(
+            prompt[0].text,
+            format!(
+                "{}\n\n{}\ntalked about rust",
+                system_text("Be terse."),
+                SUMMARY_HEADING
+            )
+        );
+    }
+
+    #[test]
+    fn a_blank_summary_adds_nothing() {
+        let prompt = build_prompt("Be terse.", Some("   \n "), &[], 4096, &word_count);
+        assert_eq!(prompt[0].text, system_text("Be terse."));
+    }
+
+    #[test]
+    fn the_system_text_prefix_is_unchanged_by_a_summary() {
+        let prompt = build_prompt("Be terse.", Some("some summary"), &[], 4096, &word_count);
+        assert!(prompt[0].text.starts_with(&system_text("Be terse.")));
+        assert_eq!(
+            system_text("Be terse."),
+            format!("{SYSTEM_PROMPT}\n\nBe terse.")
+        );
     }
 }

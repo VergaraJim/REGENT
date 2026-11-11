@@ -421,6 +421,7 @@ impl Worker {
         };
         let prompt = build_prompt(
             system_addition,
+            None,
             &history,
             engine.context_tokens(),
             &|piece| engine.count_tokens(piece),
