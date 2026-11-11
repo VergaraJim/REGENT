@@ -3,6 +3,7 @@ import { AppHeader } from "./components/AppHeader.tsx";
 import { ChatView } from "./views/ChatView.tsx";
 import { SettingsView } from "./views/SettingsView.tsx";
 import { useChat } from "./hooks/useChat.ts";
+import { useMemoryStatus } from "./hooks/useMemoryStatus.ts";
 import { useSettings } from "./hooks/useSettings.ts";
 import { useAppliedTheme } from "./theme.ts";
 
@@ -12,6 +13,7 @@ export default function App() {
   // Created here, above the view switch, so the conversation survives a visit
   // to Settings.
   const chat = useChat();
+  const memory = useMemoryStatus();
   // Treat "settings not loaded yet" as set so the hint does not flash on startup.
   const textModelSet =
     settings.view === null ||
@@ -30,6 +32,7 @@ export default function App() {
             controller={chat}
             textModelSet={textModelSet}
             onOpenSettings={() => setView("settings")}
+            memory={memory}
           />
         </>
       ) : (

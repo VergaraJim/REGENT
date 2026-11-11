@@ -9,6 +9,7 @@ import {
   stopChat,
 } from "../lib/api.ts";
 import type { ChatMessage, ChatState } from "../lib/api.ts";
+import { toolLabel } from "../lib/chatDisplay.ts";
 import { errorMessage } from "../lib/format.ts";
 
 export interface ChatController {
@@ -21,6 +22,8 @@ export interface ChatController {
   turnError: string | null;
   /** Text of the assistant reply still streaming in, or `null` when idle. */
   streamingText: string | null;
+  /** Tool labels for the reply still streaming in, in order. */
+  streamingTools: string[];
   /** Whether the current reply is waiting for old messages to be summarized. */
   compactingReply: boolean;
   /** Loads the model and gets the engine ready. */
@@ -46,12 +49,14 @@ export function useChat(): ChatController {
   const [error, setError] = useState<string | null>(null);
   const [turnError, setTurnError] = useState<string | null>(null);
   const [streamingText, setStreamingText] = useState<string | null>(null);
+  const [streamingTools, setStreamingTools] = useState<string[]>([]);
   const [compactingReply, setCompactingReply] = useState(false);
 
   const alive = useRef(true);
   const stateRef = useRef<ChatState>("stopped");
   const streaming = useRef<string | null>(null);
   const nextLocalId = useRef(-1);
+  const turnUsedTool = useRef(false);
 
   const applyState = useCallback((state: ChatState) => {
     stateRef.current = state;
@@ -103,10 +108,41 @@ export function useChat(): ChatController {
   const finishStream = useCallback(
     (messageId: number | null) => {
       const text = streaming.current ?? "";
+      const usedTool = turnUsedTool.current;
+      turnUsedTool.current = false;
       streaming.current = null;
       setStreamingText(null);
+      setStreamingTools([]);
       setCompactingReply(false);
-      if (messageId !== null && text.length > 0) {
+
+      if (usedTool) {
+        // The backend stored the turn as assistant row(s) plus tool row(s), so
+        // the local append would show the wrong shape. Reload instead; the
+        // optimistic user message stays until the reload resolves.
+        getHistory()
+          .then((history) => {
+            if (!alive.current) return;
+            setMessages(history);
+          })
+          .catch((failure: unknown) => {
+            if (!alive.current) return;
+            setTurnError(errorMessage(failure));
+            if (messageId !== null && text.length > 0) {
+              setMessages((previous) => [
+                ...previous,
+                {
+                  id: messageId,
+                  role: "assistant",
+                  text,
+                  from_voice: false,
+                  created_at: Date.now(),
+                  tool_name: null,
+                  tool_call: null,
+                },
+              ]);
+            }
+          });
+      } else if (messageId !== null && text.length > 0) {
         setMessages((previous) => [
           ...previous,
           {
@@ -144,7 +180,9 @@ export function useChat(): ChatController {
         },
       ]);
       streaming.current = "";
+      turnUsedTool.current = false;
       setStreamingText("");
+      setStreamingTools([]);
       setError(null);
       setTurnError(null);
       applyState("generating");
@@ -160,13 +198,23 @@ export function useChat(): ChatController {
             streaming.current = (streaming.current ?? "") + event.text;
             setStreamingText(streaming.current);
             break;
+          case "tool": {
+            turnUsedTool.current = true;
+            const label = toolLabel(event.name);
+            setStreamingTools((previous) =>
+              previous.includes(label) ? previous : [...previous, label],
+            );
+            break;
+          }
           case "done":
           case "cancelled":
             finishStream(event.message_id);
             break;
           case "error":
             streaming.current = null;
+            turnUsedTool.current = false;
             setStreamingText(null);
+            setStreamingTools([]);
             setCompactingReply(false);
             setTurnError(event.message);
             applyState("ready");
@@ -175,7 +223,9 @@ export function useChat(): ChatController {
       }).catch((failure: unknown) => {
         if (!alive.current) return;
         streaming.current = null;
+        turnUsedTool.current = false;
         setStreamingText(null);
+        setStreamingTools([]);
         setCompactingReply(false);
         setTurnError(errorMessage(failure));
         applyState("ready");
@@ -207,7 +257,9 @@ export function useChat(): ChatController {
       .then(() => {
         if (!alive.current) return;
         streaming.current = null;
+        turnUsedTool.current = false;
         setStreamingText(null);
+        setStreamingTools([]);
         setCompactingReply(false);
         setError(null);
         setTurnError(null);
@@ -233,6 +285,7 @@ export function useChat(): ChatController {
     error,
     turnError,
     streamingText,
+    streamingTools,
     compactingReply,
     start,
     stop,

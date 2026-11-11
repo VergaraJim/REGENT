@@ -4,12 +4,16 @@ import { Alert, Button, Spinner } from "@heroui/react";
 import { Composer } from "../components/chat/Composer.tsx";
 import { MessageBubble } from "../components/chat/MessageBubble.tsx";
 import type { ChatController } from "../hooks/useChat.ts";
+import type { MemoryStatus } from "../lib/api.ts";
+import { toDisplayMessages } from "../lib/chatDisplay.ts";
 
 export interface ChatViewProps {
   controller: ChatController;
   /** Whether the settings have a text model chosen. */
   textModelSet: boolean;
   onOpenSettings: () => void;
+  /** The memory index's state, shown as a muted line under the composer. */
+  memory?: MemoryStatus | null;
 }
 
 /** The conversation, its states, and the composer pinned to the bottom. */
@@ -17,6 +21,7 @@ export function ChatView({
   controller,
   textModelSet,
   onOpenSettings,
+  memory = null,
 }: ChatViewProps) {
   const {
     messages,
@@ -24,6 +29,7 @@ export function ChatView({
     error,
     turnError,
     streamingText,
+    streamingTools,
     compactingReply,
   } = controller;
   const listRef = useRef<HTMLDivElement>(null);
@@ -35,6 +41,8 @@ export function ChatView({
     list.scrollTop = list.scrollHeight;
   }, [messages, streamingText, chatState]);
 
+  const display = toDisplayMessages(messages);
+  const memoryLine = describeMemory(memory);
   const idle = messages.length === 0 && streamingText === null;
 
   return (
@@ -60,12 +68,13 @@ export function ChatView({
           />
         ) : (
           <>
-            {messages.map((message) => (
+            {display.map((message) => (
               <MessageBubble
-                key={message.id}
+                key={message.key}
                 role={message.role}
                 text={message.text}
-                fromVoice={message.from_voice}
+                fromVoice={message.fromVoice}
+                tools={message.tools}
               />
             ))}
             {streamingText !== null ? (
@@ -73,6 +82,7 @@ export function ChatView({
                 role="assistant"
                 text={streamingText}
                 streaming
+                tools={streamingTools}
                 placeholder={
                   compactingReply && streamingText === ""
                     ? "Compacting…"
@@ -130,9 +140,34 @@ export function ChatView({
           onSend={controller.send}
           onCancel={controller.cancel}
         />
+        {memoryLine ? (
+          <p
+            role="status"
+            aria-live="polite"
+            title={memoryLine}
+            className="truncate text-xs text-muted"
+          >
+            {memoryLine}
+          </p>
+        ) : null}
       </div>
     </main>
   );
+}
+
+/** The muted footer line for `memory`, or `null` when there is nothing to say. */
+function describeMemory(memory: MemoryStatus | null): string | null {
+  if (memory === null) return null;
+  switch (memory.state) {
+    case "off":
+      return memory.error;
+    case "ready":
+      return `Memory: ${memory.indexed} of ${memory.total} messages saved`;
+    case "indexing":
+      return `Memory: ${memory.indexed} of ${memory.total} messages saved · indexing…`;
+    case "paused":
+      return "Memory paused. Restart Regent to try again.";
+  }
 }
 
 function EmptyState({

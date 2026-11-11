@@ -146,6 +146,107 @@ describe("useChat", () => {
     chat.unmount();
   });
 
+  it("collects unique tool labels while a reply streams", async () => {
+    const chat = await mount({ state: "ready", error: null });
+
+    await act(async () => {
+      chat.current().send("What did we decide?");
+    });
+    expect(chat.current().streamingTools).toEqual([]);
+
+    await emit({ type: "tool", name: "search_memory" });
+    expect(chat.current().streamingTools).toEqual(["Searched memory"]);
+
+    await emit({ type: "tool", name: "search_memory" });
+    expect(chat.current().streamingTools).toEqual(["Searched memory"]);
+
+    await emit({ type: "tool", name: "look_at_screen" });
+    expect(chat.current().streamingTools).toEqual([
+      "Searched memory",
+      "Looked at screen",
+    ]);
+    chat.unmount();
+  });
+
+  it("reloads history after a turn that used a tool", async () => {
+    const chat = await mount({ state: "ready", error: null });
+
+    await act(async () => {
+      chat.current().send("What did we decide?");
+    });
+    await emit({ type: "tool", name: "search_memory" });
+    await emit({ type: "token", text: "Option B." });
+
+    const reloaded: ChatMessage[] = [
+      {
+        id: 1,
+        role: "user",
+        text: "What did we decide?",
+        from_voice: false,
+        created_at: 1,
+      },
+      {
+        id: 2,
+        role: "tool",
+        text: "recalled text",
+        from_voice: false,
+        created_at: 2,
+        tool_name: "search_memory",
+        tool_call: "{}",
+      },
+      {
+        id: 3,
+        role: "assistant",
+        text: "Option B.",
+        from_voice: false,
+        created_at: 3,
+      },
+    ];
+    api.getHistory.mockResolvedValue(reloaded);
+
+    await emit({
+      type: "done",
+      message_id: 3,
+      stats: {
+        prompt_tokens: 1,
+        reused_tokens: 0,
+        processed_tokens: 1,
+        generated_tokens: 2,
+        tokens_per_second: 5,
+      },
+    });
+    await act(async () => {});
+
+    expect(api.getHistory).toHaveBeenCalledTimes(2);
+    expect(chat.current().messages).toEqual(reloaded);
+    expect(chat.current().streamingTools).toEqual([]);
+    expect(chat.current().streamingText).toBeNull();
+    chat.unmount();
+  });
+
+  it("does not reload history when no tool ran", async () => {
+    const chat = await mount({ state: "ready", error: null });
+
+    await act(async () => {
+      chat.current().send("Hello");
+    });
+    await emit({ type: "token", text: "Hi" });
+    await emit({
+      type: "done",
+      message_id: 7,
+      stats: {
+        prompt_tokens: 1,
+        reused_tokens: 0,
+        processed_tokens: 1,
+        generated_tokens: 1,
+        tokens_per_second: 5,
+      },
+    });
+
+    expect(api.getHistory).toHaveBeenCalledTimes(1);
+    chat.unmount();
+  });
+
   it("clears compacting when the turn ends without tokens", async () => {
     const chat = await mount({ state: "ready", error: null });
 
