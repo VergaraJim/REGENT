@@ -14,12 +14,15 @@
 //!   on, with fakes for tests.
 //! - [`input`]: [`VoiceInput`], the always-listening pipeline that ties the
 //!   microphone, VAD, speech queue and post-filter together.
+//! - [`output`]: [`Speaker`], which turns a streamed reply into synthesized,
+//!   queued speech and publishes speaking events.
 //!
 //! Everything here assumes mono `f32` audio at [`STT_SAMPLE_RATE`] once it
 //! reaches the detector.
 
 pub mod engine;
 pub mod input;
+pub mod output;
 pub mod post_filter;
 pub mod resample;
 pub mod speech_text;
@@ -32,6 +35,11 @@ pub use engine::{
 pub use input::{
     VoiceEvent, VoiceInput, VoiceInputDeps, VoiceSink, VoiceState, VoiceStatus,
     LEVEL_INTERVAL_SAMPLES, MAX_QUEUED_UTTERANCES,
+};
+pub use output::{
+    AudioOut, AudioOutFactory, FakeAudioHandle, FakeAudioOut, FakeSynth, FakeSynthHandle, Speaker,
+    SpeakerDeps, SpeakerEvent, SpeakerSink, SynthFactory, Synthesizer, AUDIO_FAILED,
+    MIC_RESUME_DELAY_MS,
 };
 pub use post_filter::clean_transcript;
 pub use resample::{downmix, Resampler};
