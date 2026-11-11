@@ -3,6 +3,7 @@ mod state;
 
 pub mod audio;
 pub mod engine;
+pub mod stt;
 pub mod tts;
 
 use regent_core::paths::AppPaths;
